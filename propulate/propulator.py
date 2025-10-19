@@ -5,6 +5,8 @@ import os
 import pickle
 import random
 import time
+import signal
+import threading
 from operator import attrgetter
 from pathlib import Path
 from typing import Callable, Final, Generator, List, Optional, Tuple, Type, Union
@@ -20,6 +22,47 @@ from .surrogate import Surrogate
 
 log = logging.getLogger(__name__)  # Get logger instance.
 SURROGATE_KEY: Final[str] = "_s"  # Key for ``Surrogate`` data in ``Individual``
+
+# --- Signal handling for emergency checkpointing -----------------------------------------------
+# We keep a reference to the active Propulator per process and a lightweight handler
+# that performs a best-effort, local-only checkpoint dump on SIGINT/SIGTERM from island rank 0.
+_ACTIVE_PROPULATOR: Optional["Propulator"] = None
+_SIGNAL_INSTALLED = False
+_SIGNAL_DUMP_LOCK = threading.Lock()
+
+
+def _install_signal_handlers() -> None:
+    global _SIGNAL_INSTALLED
+    if _SIGNAL_INSTALLED:
+        return
+
+    def _on_signal(signum, frame):  # type: ignore[unused-argument]
+        p = _ACTIVE_PROPULATOR
+        if p is None:
+            return
+        # Only dump from island rank 0 and only if this rank participates in Propulate.
+        try:
+            if p.propulate_comm is not None and p.island_comm is not None and p.island_comm.rank == 0:
+                with _SIGNAL_DUMP_LOCK:
+                    # Local-only dump: avoid any MPI calls in a signal handler.
+                    p._dump_checkpoint_local()
+                    log.info("Signal %s received: emergency checkpoint written by island rank 0.", signum)
+        except Exception as e:
+            # Never raise from a signal handler; just log best effort.
+            try:
+                log.warning("Signal %s: failed to write emergency checkpoint: %s", signum, e)
+            except Exception:
+                pass
+
+    try:
+        signal.signal(signal.SIGINT, _on_signal)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+    except Exception:
+        pass
+    _SIGNAL_INSTALLED = True
 
 
 class Propulator:
@@ -168,6 +211,12 @@ class Propulator:
         self.intra_requests: list[MPI.Request] = []  # Keep track of intra-island send requests.
         self.intra_buffers: list[Individual] = []  # Send buffers for intra-island communication
 
+        # Register this instance for signal-based emergency checkpointing.
+        # Only meaningful for ranks participating in the Propulate communicator.
+        global _ACTIVE_PROPULATOR
+        _ACTIVE_PROPULATOR = self
+        _install_signal_handlers()
+
         # Load initial population of evaluated individuals from checkpoint if exists.
         load_ckpt_file = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
         if not os.path.isfile(load_ckpt_file):  # If not exists, check for backup file.
@@ -190,6 +239,26 @@ class Propulator:
             self.population = []
             if self.island_comm.rank == 0:
                 log.info("No valid checkpoint file given. Initializing population randomly...")
+
+    def _dump_checkpoint_local(self) -> None:
+        """Best-effort local checkpoint dump.
+
+        This is safe to call from a signal handler context because it avoids MPI calls
+        and token passing. It writes the same per-island file as the regular checkpoint
+        writer with the same backup strategy.
+        """
+        try:
+            save_ckpt_file = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
+            if os.path.isfile(save_ckpt_file):
+                try:
+                    os.replace(save_ckpt_file, save_ckpt_file.with_suffix(".bkp"))
+                except OSError as e:
+                    log.warning(e)
+            # Note: writing pickle in a handler is best-effort; we keep it minimal and atomic as far as possible.
+            with open(save_ckpt_file, "wb") as f:
+                pickle.dump(self.population, f)
+        except Exception as e:
+            log.warning("Emergency checkpoint failed: %s", e)
 
     def _get_active_individuals(self) -> Tuple[List[Individual], int]:
         """
@@ -490,7 +559,7 @@ class Propulator:
     def _intra_send_cleanup(self) -> None:
         """Delete all send buffers that have been sent."""
         # Test for requests to complete.
-        completed = MPI.Request.Testsome(self.intra_requests)
+        completed = MPI.Request.Testsome(self.intra_requests) or []
         # Remove requests and buffers of complete send operations.
         self.intra_requests = [r for i, r in enumerate(self.intra_requests) if i not in completed]
         self.intra_buffers = [b for i, b in enumerate(self.intra_buffers) if i not in completed]
@@ -615,6 +684,7 @@ class Propulator:
             populations = self.island_comm.gather(self.population, root=0)
             occurrences, _ = self._check_for_duplicates(True, debug)
             if self.island_comm.rank == 0:
+                assert populations is not None
                 if self._check_intra_island_synchronization(populations):
                     log.info(f"Island {self.island_idx}: Populations among workers synchronized.")
                 else:
