@@ -154,7 +154,6 @@ class TestAcceptanceRateScheduler:
             low_rate=0.1,
             high_rate=0.3,
             shrink_factor=0.9,
-            expand_factor=1.1,
         )
         defaults.update(kwargs)
         return AcceptanceRateScheduler(**defaults)
@@ -166,12 +165,12 @@ class TestAcceptanceRateScheduler:
         result = sched.compute(inds, 1.0)
         assert result == pytest.approx(1.0 * 0.9)
 
-    def test_relaxes_when_below_low_rate(self):
+    def test_holds_when_below_low_rate(self):
         sched = self._make_sched()
-        # window=10, 0 accepted → rate=0.0 < low_rate=0.1
+        # window=10, 0 accepted → rate=0.0 < low_rate=0.1; scheduler can only hold
         inds = make_inds([5.0] * 10)
         result = sched.compute(inds, 1.0)
-        assert result == pytest.approx(1.0 * 1.1)
+        assert result == pytest.approx(1.0)
 
     def test_unchanged_in_target_zone(self):
         sched = self._make_sched()
@@ -311,9 +310,6 @@ class TestABCPMCStateless:
         rng2 = random.Random(0)
         abc1 = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng1)
         abc2 = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng2)
-        # Fix numpy RNG seeds too
-        abc1.rng_np = np.random.default_rng(42)
-        abc2.rng_np = np.random.default_rng(42)
         inds = self._build_archive(n=10, max_loss=9.0, tol=10.0)
         child1 = abc1(inds=inds)
         child2 = abc2(inds=inds)
@@ -342,6 +338,57 @@ class TestABCPMCEdgeCases:
     def test_integer_limits_raise(self):
         with pytest.raises(ValueError, match="continuous"):
             ABCPMC({"x": (0, 10), "y": (0.0, 1.0)})
+
+    def test_none_weight_in_archive_falls_back_to_one(self, caplog):
+        """Archive individuals with weight=None must not produce NaN; warning is emitted."""
+        import logging
+
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        inds = []
+        for i in range(5):
+            ind = Individual({"x": 0.2 * (i + 1), "y": 0.5}, LIMITS, tolerance=10.0, generation=i)
+            ind.loss = float(i + 1)
+            ind.weight = None  # simulate individual from an external propagator
+            inds.append(ind)
+        with caplog.at_level(logging.WARNING, logger="propulate.propagators.abcpmc"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=inds)
+        assert child.weight is not None
+        assert not np.isnan(child.weight)
+        assert "weight=None" in caplog.text
+
+
+class TestABCPMCSchedulerGuard:
+    """Tests for fix 2d: scheduler is only called after archive-size check."""
+
+    def test_prior_phase_not_skipped_by_tight_scheduler(self):
+        """With < k accepted individuals, scheduler must not be called (prior phase)."""
+        # k=5, only 4 individuals below tol → preliminary archive is too small
+        abc = ABCPMC(
+            LIMITS, k=5, tol=10.0,
+            scheduler_type="acceptance_rate",
+            additional_needed_inds=0, low_rate=0.1, high_rate=0.3, shrink_factor=0.5,
+        )
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(4)]
+        child = abc(inds=inds)
+        assert child.weight == 1.0       # prior phase
+        assert child.tolerance is None   # not stamped
+
+    def test_fallback_when_scheduler_tightens_too_aggressively(self):
+        """When tighter tol would shrink archive below k, hold at tol_from_history."""
+        # k=3, 5 individuals with losses [1,2,3,4,5], tol=10.0
+        # shrink_factor=0.05 → candidate_tol=0.5 → 0 individuals survive → fallback
+        abc = ABCPMC(
+            LIMITS, k=3, tol=10.0,
+            scheduler_type="acceptance_rate",
+            additional_needed_inds=0, low_rate=0.01, high_rate=0.99, shrink_factor=0.05,
+        )
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            child = abc(inds=inds)
+        assert child.tolerance == pytest.approx(10.0)
 
 
 class TestFilterByTolerance:

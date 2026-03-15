@@ -38,6 +38,15 @@ class ABCPMC(Propagator):
         therefore an approximation that degrades gracefully for slowly-changing
         archives.
 
+    .. note::
+        **Prior-phase weight mixing**: prior-phase individuals sampled before
+        the archive fills are assigned ``weight=1.0`` (uniform prior).  Once
+        the archive phase begins, these individuals may coexist in the archive
+        alongside importance-weighted particles, mixing two weighting schemes.
+        This is a benign approximation for large archives but importance-weight
+        statistics should be treated as unreliable while the archive is newly
+        formed.
+
     See Also
     --------
     :class:`Propagator` : The parent class.
@@ -52,7 +61,7 @@ class ABCPMC(Propagator):
         scheduler_type: str = "acceptance_rate",
         additional_needed_inds: Optional[int] = None,
         rng: Optional[random.Random] = None,
-        **kwargs: Dict[str, Union[float, int, str]],
+        **kwargs: Union[float, int, str],
     ) -> None:
         """
         Initialize the ABCPMC propagator.
@@ -94,7 +103,7 @@ class ABCPMC(Propagator):
         self.tolerance_scheduler = create_scheduler(
             scheduler_type, tol, k, self.additional_needed_inds, **kwargs
         )
-        self.rng_np = np.random.default_rng()
+        self.rng_np = np.random.default_rng(rng.getrandbits(128) if rng is not None else None)
         # Uniform prior density = 1 / volume (float limits only)
         float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], float)}
         if len(float_limits) != len(self.limits):
@@ -166,9 +175,7 @@ class ABCPMC(Propagator):
             return np.zeros((values.shape[1], values.shape[1]))
         factor = w / denom
         diffs = values - mean
-        cov = np.zeros((values.shape[1], values.shape[1]))
-        for i in range(len(weights)):
-            cov += weights[i] * np.outer(diffs[i], diffs[i])
+        cov = np.einsum("i,ij,ik->jk", weights, diffs, diffs)
         return factor * cov
 
     def __call__(self, inds: List[Individual]) -> Individual:
@@ -181,11 +188,12 @@ class ABCPMC(Propagator):
         Steps
         -----
         1. Reconstruct effective tolerance from ``ind.tolerance`` fields.
-        2. Propose lower tolerance via the scheduler (monotone guarantee).
-        3. Build archive = top-k accepted individuals.
-        4. If archive too small → sample from prior.
-        5. Otherwise build Gaussian mixture kernel and sample candidate.
-        6. Stamp candidate with effective tolerance and compute importance weight.
+        2. Check preliminary archive at current tolerance; if too small → prior phase.
+        3. Call scheduler to propose a tighter tolerance (monotone guarantee).
+        4. Accept tighter tolerance only if the archive remains full; otherwise hold.
+        5. Build perturbation kernel from archive.
+        6. Sample candidate by perturbing a weighted-random archive member.
+        7. Stamp candidate with effective tolerance and compute importance weight.
 
         Parameters
         ----------
@@ -202,21 +210,44 @@ class ABCPMC(Propagator):
             (ind.tolerance for ind in inds if ind.tolerance is not None),
             default=self.tol,
         )
-        proposed_tol = self.tolerance_scheduler.compute(inds, tol_from_history)
-        effective_tol = min(tol_from_history, proposed_tol)  # monotone guarantee
 
-        # 2. Build archive
-        archive = self.select_archive(inds, effective_tol)
-
-        # 3. Prior phase: archive not yet large enough
-        if len(archive) < self.k:
+        # 2. Prior-phase guard: check archive BEFORE calling scheduler to avoid
+        #    premature tolerance tightening that could oscillate the archive below k.
+        preliminary_archive = self.select_archive(inds, tol_from_history)
+        if len(preliminary_archive) < self.k:
             sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
             child = Individual(position=sample, limits=self.limits)
             child.weight = 1.0
             return child
 
-        # 4. Build perturbation kernel from archive
-        weights = np.array([ind.weight for ind in archive], dtype=float)
+        # 3. Archive is full — safe to call scheduler and propose a tighter tolerance
+        proposed_tol = self.tolerance_scheduler.compute(inds, tol_from_history)
+        candidate_tol = min(tol_from_history, proposed_tol)  # monotone guarantee
+
+        # 4. Accept tighter tolerance only if the archive remains full; otherwise hold
+        if len(self.select_archive(inds, candidate_tol)) >= self.k:
+            effective_tol = candidate_tol
+            archive = self.select_archive(inds, effective_tol)
+        else:
+            effective_tol = tol_from_history
+            archive = preliminary_archive  # reuse; avoids redundant sort
+
+        # 5. Build perturbation kernel from archive
+        _raw_weights = []
+        _warned_none = False
+        for ind in archive:
+            if ind.weight is None:
+                if not _warned_none:
+                    logger.warning(
+                        "ABCPMC: one or more archive individuals have weight=None "
+                        "(likely from an external propagator). Falling back to weight=1.0 "
+                        "for those individuals; importance weights will be approximate."
+                    )
+                    _warned_none = True
+                _raw_weights.append(1.0)
+            else:
+                _raw_weights.append(ind.weight)
+        weights = np.array(_raw_weights, dtype=float)
         weights /= weights.sum()
 
         positions = np.stack([ind.position for ind in archive])
@@ -228,7 +259,7 @@ class ABCPMC(Propagator):
         if eigs.min() <= 0:
             kernel_cov += (-eigs.min() + 1e-8) * np.eye(positions.shape[1])
 
-        # 5. Sample candidate
+        # 6. Sample candidate
         idx = self.rng.choices(range(len(archive)), weights=weights.tolist())[0]
         parent = archive[idx]
 
@@ -242,7 +273,7 @@ class ABCPMC(Propagator):
         child = Individual(position=candidate_pos, limits=self.limits)
         child.tolerance = effective_tol  # stamped for future history reconstruction
 
-        # 6. Compute importance weight w* = pi(theta*) / q_n(theta*)
+        # 7. Compute importance weight w* = pi(theta*) / q_n(theta*)
         pdfs = []
         for wp in archive:
             try:
@@ -384,6 +415,28 @@ class GeometricDecayScheduler(EpsilonScheduler):
         self.decay_factor = decay_factor
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
+        """
+        Propose the next tolerance by replaying epoch history from ``initial_tol``.
+
+        Parameters
+        ----------
+        inds : List[Individual]
+            Full evaluated history.
+        current_tol : float
+            The current effective tolerance.  **Intentionally unused.**  This
+            scheduler is fully stateless and reconstructs the epoch count by
+            replaying batches of accepted individuals starting from
+            ``self.initial_tol``.  This makes ``compute`` idempotent across
+            repeated calls on the same history snapshot, at the cost of ignoring
+            any tolerance value externally imposed outside the geometric decay
+            schedule.  The monotone guarantee in ``ABCPMC.__call__`` ensures the
+            returned value never exceeds the actual current tolerance.
+
+        Returns
+        -------
+        float
+            Proposed tolerance for the next epoch.
+        """
         batch_size = self.population_size + self.additional_needed_inds
         accepted_all = sorted(
             [ind for ind in inds if ind.loss < self.initial_tol],
@@ -406,8 +459,18 @@ class AcceptanceRateScheduler(EpsilonScheduler):
     Adjusts tolerance based on the acceptance rate in a recent sliding window.
 
     The window size is ``population_size + additional_needed_inds``.  If the
-    most recent window contains too many accepted individuals the tolerance is
-    tightened; if too few, it is relaxed.
+    most recent window contains more accepted individuals than ``high_rate``
+    allows, the tolerance is tightened by ``shrink_factor``.  When the
+    acceptance rate is below ``low_rate`` the scheduler holds the current
+    tolerance unchanged.
+
+    .. note::
+        Tolerance expansion is architecturally impossible in this design: the
+        monotone guarantee in ``ABCPMC.__call__`` clips any proposed value
+        above ``tol_from_history`` to ``tol_from_history``.  An ``expand_factor``
+        parameter was previously present but removed because it was silently
+        discarded on every call.  If the acceptance rate drops too low, the
+        algorithm holds the tolerance and waits for more accepted individuals.
     """
 
     def __init__(
@@ -418,7 +481,6 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         low_rate: float = 0.1,
         high_rate: float = 0.3,
         shrink_factor: float = 0.9,
-        expand_factor: float = 1.1,
     ):
         super().__init__(initial_tol, population_size, additional_needed_inds)
         if not (0 < low_rate < high_rate < 1):
@@ -426,7 +488,6 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         self.low_rate = low_rate
         self.high_rate = high_rate
         self.shrink_factor = shrink_factor
-        self.expand_factor = expand_factor
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         window_size = self.population_size + self.additional_needed_inds
@@ -437,8 +498,6 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         rate = len(accepted) / len(recent)
         if rate > self.high_rate:
             return current_tol * self.shrink_factor
-        elif rate < self.low_rate:
-            return current_tol * self.expand_factor
         return current_tol
 
 
