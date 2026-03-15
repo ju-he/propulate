@@ -38,6 +38,8 @@ class Individual:
         position: Union[MutableMapping[str, Union[str, int, float, Any]], np.ndarray],
         limits: Mapping[str, Union[Tuple[float, float], Tuple[int, int], Tuple[str, ...]]],
         velocity: Optional[np.ndarray] = None,
+        weight: Optional[float] = None,
+        tolerance: Optional[float] = None,
         generation: int = -1,
         rank: int = -1,
     ) -> None:
@@ -99,6 +101,10 @@ class Individual:
             if not self.position.shape == self.velocity.shape:
                 print(self.position.shape, self.velocity.shape)
                 raise ValueError("Position and velocity shape do not match.")
+        
+        # NOTE needed for ABC propagator
+        self.weight = weight
+        self.tolerance = tolerance
 
     def __getitem__(self, key: str) -> Union[float, int, str]:
         """Return decoded value for input key."""

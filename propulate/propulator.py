@@ -601,6 +601,7 @@ class Propulator:
         if self.propulate_comm is None:
             return None
         active_pop, num_active = self._get_active_individuals()
+
         assert np.all(np.array(self.island_comm.allgather(num_active), dtype=int) == num_active)
         if self.island_counts is not None:
             num_active = int(self.propulate_comm.allreduce(num_active / self.island_counts[self.island_idx]))

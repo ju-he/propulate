@@ -1,5 +1,6 @@
 """This package bundles all classes that are used as propagators in Propulate's optimization routine."""
 
+from .abc import ABC
 from .base import (
     Compose,
     Conditional,
@@ -90,4 +91,5 @@ __all__ = [
     "SingleCPUFitter",
     "create_fitter",
     "get_default_kernel_sklearn",
+    "ABC",
 ]
