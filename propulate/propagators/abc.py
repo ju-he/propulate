@@ -1,4 +1,5 @@
 import logging
+import random
 import warnings
 from abc import ABC as AbstractBase
 from abc import abstractmethod
@@ -16,7 +17,27 @@ logger = logging.getLogger(__name__)
 
 class ABC(Propagator):
     """
-    This propagator implements approximate bayesian computation.
+    Steady-state asynchronous ABC propagator.
+
+    The algorithm is fully stateless: all algorithm state (effective tolerance,
+    active archive) is reconstructed from the evaluated-history list ``inds``
+    passed to ``__call__`` on every invocation.  No mutable instance variables
+    are modified after construction, making the propagator safe for asynchronous
+    HPC execution without synchronization barriers.
+
+    Tolerance memory is carried by each proposed ``Individual`` via the
+    ``Individual.tolerance`` field.  The effective tolerance at any call is
+    ``min(ind.tolerance for ind in inds if ind.tolerance is not None)``,
+    falling back to the constructor argument ``tol`` when history is empty.
+    A monotone decrease is guaranteed by taking the min of the history value
+    and the scheduler's proposed value.
+
+    .. note::
+        **Weight staleness**: importance weights (``child.weight``) are computed
+        against the archive state at proposal time.  In asynchronous execution
+        results may arrive after the archive has evolved; the weights are
+        therefore an approximation that degrades gracefully for slowly-changing
+        archives.
 
     See Also
     --------
@@ -31,7 +52,8 @@ class ABC(Propagator):
         tol: float = 600.0,
         scheduler_type: str = "acceptance_rate",
         additional_needed_inds: Optional[int] = None,
-        **kwargs: Dict[str, Union[float, int, str]],  # Additional parameters for the scheduler
+        rng: Optional[random.Random] = None,
+        **kwargs: Dict[str, Union[float, int, str]],
     ) -> None:
         """
         Initialize the ABC propagator.
@@ -39,55 +61,84 @@ class ABC(Propagator):
         Parameters
         ----------
         limits : Dict
-            Search-space limits for each gene.
+            Search-space limits for each gene (float intervals only).
         perturbation_scale : float
             Scale factor for the Gaussian perturbation covariance.
         k : int
-            Number of best individuals to use as the population.
+            Archive size: number of best accepted individuals used to build
+            the mixture proposal.
         tol : float
-            Distance tolerance for accepting a new sample (default=5.0).
+            Initial tolerance.  This value is **never mutated** after
+            construction; it serves only as the fallback when history is empty.
         scheduler_type : str
-            The type of tolerance scheduler to use. Options are 'quantile', 'geometric_decay', 'acceptance_rate'.
+            Tolerance scheduler.  One of ``'quantile'``,
+            ``'geometric_decay'``, ``'acceptance_rate'``.
         additional_needed_inds : int, optional
-            How many additional individuals are needed to update the tolerance.
-            If None, defaults to k.
-        **kwargs : Dict[str, Union[float, int, str]]
-            Additional parameters for the scheduler, such as percentile for quantile scheduling,
-            decay factor for geometric decay, or low/high rates for acceptance rate scheduling.
+            Minimum number of *extra* accepted individuals beyond ``k`` before
+            the scheduler proposes a tolerance update.  Defaults to ``k``.
+        rng : random.Random, optional
+            Random number generator forwarded to the base ``Propagator``.
+        **kwargs
+            Additional parameters forwarded to the scheduler constructor
+            (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
+            decay, ``low_rate``/``high_rate`` for acceptance rate).
         """
-        super().__init__(-1, 1)
+        super().__init__(-1, 1, rng=rng)
         self.limits = limits
         self.perturbation_scale = perturbation_scale
         self.k = k
-        self.tol = tol
+        self.tol = tol  # read-only initial tolerance; never mutated
         if additional_needed_inds is None:
             self.additional_needed_inds = k
         else:
             self.additional_needed_inds = additional_needed_inds
-        self.tolerance_scheduler = create_scheduler(scheduler_type, tol, k, self.additional_needed_inds, **kwargs)
+        self.tolerance_scheduler = create_scheduler(
+            scheduler_type, tol, k, self.additional_needed_inds, **kwargs
+        )
         self.rng_np = np.random.default_rng()
-        # compute uniform prior density = 1 / volume (float limits only)
-        float_limits = {k: v for k, v in self.limits.items() if isinstance(v[0], float)}
+        # Uniform prior density = 1 / volume (float limits only)
+        float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], float)}
         if len(float_limits) != len(self.limits):
             raise ValueError("ABC requires all search-space limits to be continuous (float) intervals.")
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
 
-    def filter_by_tolerance(self, inds) -> List[Individual]:
+    def filter_by_tolerance(self, inds: List[Individual], tol: float) -> List[Individual]:
         """
-        Return a list of individuals from inds whose loss < tol.
+        Return individuals whose loss is strictly below *tol*.
 
         Parameters
         ----------
-        inds : List[propulate.population.Individual]
-            The individuals the propagator is applied to.
+        inds : List[Individual]
+            Candidate individuals.
+        tol : float
+            Tolerance threshold.
 
         Returns
         -------
-        List[propulate.population.Individual]
-            The individuals filtered by loss smaller than tolerance.
+        List[Individual]
+            Filtered list.
         """
-        return [ind for ind in inds if ind.loss < self.tol]
+        return [ind for ind in inds if ind.loss < tol]
+
+    def select_archive(self, inds: List[Individual], tol: float) -> List[Individual]:
+        """
+        Return up to ``k`` best accepted individuals as the active archive.
+
+        Parameters
+        ----------
+        inds : List[Individual]
+            Full evaluated history.
+        tol : float
+            Current effective tolerance.
+
+        Returns
+        -------
+        List[Individual]
+            Top-k accepted individuals sorted by loss (ascending).
+        """
+        accepted = self.filter_by_tolerance(inds, tol)
+        return sorted(accepted, key=lambda ind: ind.loss)[: self.k]
 
     def weighted_covariance(self, values: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """
@@ -109,16 +160,12 @@ class ABC(Propagator):
         """
         values = np.asarray(values)
         weights = np.asarray(weights)
-        # Compute weighted mean
         mean = np.average(values, axis=0, weights=weights)
         w = weights.sum()
-        # Denominator for bias correction
         denom = w**2 - np.sum(weights**2)
         if denom <= 0:
-            # Cannot compute unbiased covariance with <=1 effective samples
             return np.zeros((values.shape[1], values.shape[1]))
         factor = w / denom
-        # Compute weighted scatter
         diffs = values - mean
         cov = np.zeros((values.shape[1], values.shape[1]))
         for i in range(len(weights)):
@@ -127,73 +174,88 @@ class ABC(Propagator):
 
     def __call__(self, inds: List[Individual]) -> Individual:
         """
-        Generate a new individual using the ABC algorithm.
+        Generate a new candidate individual.
 
-        If no parents provided, generate the first individual from the prior.
-        Otherwise, take the k newest parents, build a perturbation kernel,
-        and sample until the distance is <= tol.
+        The algorithm is fully stateless: all required state is derived from
+        *inds* on every call.
+
+        Steps
+        -----
+        1. Reconstruct effective tolerance from ``ind.tolerance`` fields.
+        2. Propose lower tolerance via the scheduler (monotone guarantee).
+        3. Build archive = top-k accepted individuals.
+        4. If archive too small → sample from prior.
+        5. Otherwise build Gaussian mixture kernel and sample candidate.
+        6. Stamp candidate with effective tolerance and compute importance weight.
 
         Parameters
         ----------
-        inds : List[propulate.population.Individual]
-            The individuals the propagator is applied to.
+        inds : List[Individual]
+            Full evaluated history passed by Propulate.
 
         Returns
         -------
-        propulate.population.Individual
-            The individual after application of the propagator.
+        Individual
+            The next candidate (unevaluated, ``loss == inf``).
         """
-        # Initial generations: population not big enough
+        # 1. Reconstruct effective tolerance from stamped history
+        tol_from_history = min(
+            (ind.tolerance for ind in inds if ind.tolerance is not None),
+            default=self.tol,
+        )
+        proposed_tol = self.tolerance_scheduler.compute(inds, tol_from_history)
+        effective_tol = min(tol_from_history, proposed_tol)  # monotone guarantee
 
-        usable_pop = self.filter_by_tolerance(inds)
+        # 2. Build archive
+        archive = self.select_archive(inds, effective_tol)
 
-        if len(usable_pop) < self.k:
-            sample = {}
-            for key, limit in self.limits.items():
-                sample[key] = self.rng.uniform(limit[0], limit[1])
+        # 3. Prior phase: archive not yet large enough
+        if len(archive) < self.k:
+            sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
             child = Individual(position=sample, limits=self.limits)
             child.weight = 1.0
             return child
 
-        # Update tolerance based on the scheduler for next generation
-        self.tol = self.tolerance_scheduler.update(usable_pop, inds)
+        # 4. Build perturbation kernel from archive
+        weights = np.array([ind.weight for ind in archive], dtype=float)
+        weights /= weights.sum()
 
-        # Select k most recent individuals (sorted by generation to ensure temporal order)
-        working_pop = sorted(usable_pop, key=lambda ind: ind.generation)[-self.k :]
-
-        weights = np.array([ind.weight for ind in working_pop], dtype=float)
-        weights /= weights.sum()  # normalize
-
-        positions = np.stack([ind.position for ind in working_pop])
+        positions = np.stack([ind.position for ind in archive])
         cov = self.weighted_covariance(positions, weights)
         cov += 1e-6 * np.eye(positions.shape[1])
         kernel_cov = self.perturbation_scale * cov
-        # ensure true SPD
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
         eigs = np.linalg.eigvalsh(kernel_cov)
         if eigs.min() <= 0:
             kernel_cov += (-eigs.min() + 1e-8) * np.eye(positions.shape[1])
 
-        idx = self.rng.choices(range(len(working_pop)), weights=weights.tolist())[0]
-        parent = working_pop[idx]
+        # 5. Sample candidate
+        idx = self.rng.choices(range(len(archive)), weights=weights.tolist())[0]
+        parent = archive[idx]
 
-        candidate_pos = parent.position + self.rng_np.multivariate_normal(mean=np.zeros(positions.shape[1]), cov=kernel_cov)
-
-        # Clip candidate to search-space bounds
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
+        candidate_pos = parent.position + self.rng_np.multivariate_normal(
+            mean=np.zeros(positions.shape[1]), cov=kernel_cov
+        )
         candidate_pos = np.clip(candidate_pos, lo, hi)
 
         child = Individual(position=candidate_pos, limits=self.limits)
-        child.tolerance = self.tol
+        child.tolerance = effective_tol  # stamped for future history reconstruction
 
+        # 6. Compute importance weight w* = pi(theta*) / q_n(theta*)
         pdfs = []
-        for wp in working_pop:
+        for wp in archive:
             try:
-                p = multivariate_normal.pdf(child.position, mean=wp.position, cov=kernel_cov, allow_singular=True)
+                p = multivariate_normal.pdf(
+                    child.position, mean=wp.position, cov=kernel_cov, allow_singular=True
+                )
             except np.linalg.LinAlgError:
                 p = multivariate_normal.pdf(
-                    child.position, mean=wp.position, cov=kernel_cov + 1e-6 * np.eye(positions.shape[1]), allow_singular=True
+                    child.position,
+                    mean=wp.position,
+                    cov=kernel_cov + 1e-6 * np.eye(positions.shape[1]),
+                    allow_singular=True,
                 )
             pdfs.append(p)
 
@@ -215,92 +277,138 @@ class ToleranceScheduler(AbstractBase):
     """
     Base class for tolerance scheduling in ABC-PMC.
 
-    All schedulers implement `update(accepted_inds, all_inds)` with a unified signature.
-    Subclasses should use only the parameters they need.
+    Subclasses must implement ``compute(inds, current_tol)`` — a **pure function**
+    of the evaluated history and the current effective tolerance.  No mutable
+    state should be modified by ``compute``; all scheduling logic must be
+    derivable from ``inds`` alone.
     """
 
     def __init__(self, initial_tol: float, population_size: int, additional_needed_inds: int):
-        self.current_tol = initial_tol
+        self.initial_tol = initial_tol
+        self.current_tol = initial_tol  # kept for backward-compat with deprecated update()
         self.population_size = population_size
-        self.additional_needed_inds = additional_needed_inds  # how often to update tolerance
-
-    def condition_fulfilled(self, accepted_inds: List[Individual]) -> bool:
-        """Return True when enough new individuals have accumulated to warrant a tolerance update."""
-        return len(accepted_inds) >= self.population_size + self.additional_needed_inds
+        self.additional_needed_inds = additional_needed_inds
 
     @abstractmethod
-    def update(self, accepted_inds: Optional[List[Individual]] = None, all_inds: Optional[List[Individual]] = None) -> float:
+    def compute(self, inds: List[Individual], current_tol: float) -> float:
         """
-        Compute and set the next tolerance value.
+        Propose the next tolerance as a pure function of history.
 
         Parameters
         ----------
-        accepted_inds : Optional[List[Any]]
-            Individuals accepted in the last generation (soft generation of size k).
-        all_inds : Optional[List[Any]]
-            All proposed individuals in the last batch (used for acceptance rate).
+        inds : List[Individual]
+            Full evaluated history (all individuals, pre-filtered or not).
+        current_tol : float
+            The current effective tolerance reconstructed from history.
 
         Returns
         -------
         float
-            The updated tolerance.
+            Proposed new tolerance.  The caller (``ABC.__call__``) enforces
+            the monotone guarantee via ``min(current_tol, proposed)``.
         """
         ...
+
+    def update(
+        self,
+        accepted_inds: Optional[List[Individual]] = None,
+        all_inds: Optional[List[Individual]] = None,
+    ) -> float:
+        """Deprecated. Use ``compute(inds, current_tol)`` instead."""
+        warnings.warn(
+            "ToleranceScheduler.update() is deprecated and will be removed in a future release. "
+            "Use compute(inds, current_tol) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        all_inds = all_inds or []
+        accepted_inds = accepted_inds or []
+        current_tol = self.current_tol
+        proposed = self.compute(all_inds, current_tol)
+        self.current_tol = min(current_tol, proposed)
+        return self.current_tol
 
 
 class QuantileToleranceScheduler(ToleranceScheduler):
     """
-    Shrinks tolerance to a given percentile of the previous generation's losses.
+    Shrinks tolerance to a given percentile of the losses of *accepted* individuals.
+
+    Unlike the prior stateful implementation, ``compute`` operates only on
+    individuals already accepted at ``current_tol``, avoiding the all-history
+    bias that arises when prior-phase samples (with large losses) are included.
     """
 
-    def __init__(self, initial_tol: float, population_size: int, additional_needed_inds: int, percentile: float = 50.0):
+    def __init__(
+        self,
+        initial_tol: float,
+        population_size: int,
+        additional_needed_inds: int,
+        percentile: float = 50.0,
+    ):
         super().__init__(initial_tol, population_size, additional_needed_inds)
         if not (0 < percentile < 100):
             raise ValueError("Percentile must be between 0 and 100.")
         self.percentile = percentile
 
-    def update(self, accepted_inds: List[Individual], all_inds: Optional[List[Individual]] = None) -> float:
-        if not self.condition_fulfilled(accepted_inds):
-            return self.current_tol
-        if accepted_inds is None or len(accepted_inds) == 0:
-            raise ValueError("`accepted_inds` must be a non-empty list for quantile scheduling.")
-
-        # gather losses of accepted individuals
-        losses = [ind.loss for ind in accepted_inds]
-        # compute new tolerance as the specified percentile of losses
-        new_tol = float(np.percentile(losses, self.percentile))
-        self.current_tol = new_tol
-        return self.current_tol
+    def compute(self, inds: List[Individual], current_tol: float) -> float:
+        accepted = [ind for ind in inds if ind.loss < current_tol]
+        if len(accepted) < self.population_size + self.additional_needed_inds:
+            return current_tol
+        losses = [ind.loss for ind in accepted]
+        return float(np.percentile(losses, self.percentile))
 
 
 class GeometricDecayToleranceScheduler(ToleranceScheduler):
     """
-    Shrinks tolerance by a fixed multiplicative factor each generation.
+    Shrinks tolerance by a fixed multiplicative factor per completed epoch.
+
+    An *epoch* is a batch of ``population_size + additional_needed_inds``
+    accepted individuals (those with ``loss < initial_tol``), processed in
+    generation order.  The tolerance for epoch ``n`` is
+    ``initial_tol * decay_factor^n``, but only if enough individuals in each
+    batch survive the tightened threshold.
+
+    The reconstruction is fully stateless: epoch count is derived from the
+    length of accepted history divided by the batch size.
     """
 
-    def __init__(self, initial_tol: float, population_size: int, additional_needed_inds: int, decay_factor: float = 0.9):
+    def __init__(
+        self,
+        initial_tol: float,
+        population_size: int,
+        additional_needed_inds: int,
+        decay_factor: float = 0.9,
+    ):
         super().__init__(initial_tol, population_size, additional_needed_inds)
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
-        self.decay_factor = decay_factor 
+        self.decay_factor = decay_factor
 
-    def update(self, accepted_inds: List[Individual], all_inds: Optional[List[Individual]] = None) -> float:
-        # ignore all_inds
-        if accepted_inds is None or len(accepted_inds) == 0:
-            raise ValueError("`accepted_inds` must be a non-empty list for geometric decay scheduling.")
-        if not self.condition_fulfilled(accepted_inds):
-            return self.current_tol
-        next_tol = self.decay_factor * self.current_tol
-        if len([ind for ind in accepted_inds if ind.loss < next_tol]) >= self.population_size:
-            # if enough individuals accepted, shrink tolerance
-            self.current_tol = next_tol
-        return self.current_tol
+    def compute(self, inds: List[Individual], current_tol: float) -> float:
+        batch_size = self.population_size + self.additional_needed_inds
+        accepted_all = sorted(
+            [ind for ind in inds if ind.loss < self.initial_tol],
+            key=lambda i: i.generation,
+        )
+        tol = self.initial_tol
+        consumed = 0
+        while consumed + batch_size <= len(accepted_all):
+            batch = accepted_all[consumed : consumed + batch_size]
+            next_tol = self.decay_factor * tol
+            surviving = [i for i in batch if i.loss < next_tol]
+            if len(surviving) >= self.population_size:
+                tol = next_tol
+            consumed += batch_size
+        return tol
 
 
 class AcceptanceRateToleranceScheduler(ToleranceScheduler):
     """
-    Adjusts tolerance based on the acceptance rate computed from the sizes
-    of accepted_inds and all_inds.
+    Adjusts tolerance based on the acceptance rate in a recent sliding window.
+
+    The window size is ``population_size + additional_needed_inds``.  If the
+    most recent window contains too many accepted individuals the tolerance is
+    tightened; if too few, it is relaxed.
     """
 
     def __init__(
@@ -321,24 +429,18 @@ class AcceptanceRateToleranceScheduler(ToleranceScheduler):
         self.shrink_factor = shrink_factor
         self.expand_factor = expand_factor
 
-    def update(self, accepted_inds: List[Individual], all_inds: Optional[List[Individual]] = None) -> float:
-        if not self.condition_fulfilled(accepted_inds):
-            return self.current_tol
-        if accepted_inds is None or all_inds is None or len(all_inds) == 0:
-            raise ValueError("Both `accepted_inds` and `all_inds` must be provided and non-empty to compute acceptance rate.")
-
-        # compute acceptance rate
-        acceptance_rate = len(accepted_inds) / len(all_inds)
-
-        # adjust tolerance based on rate
-        if acceptance_rate > self.high_rate:
-            # too many accepted, tighten tolerance
-            self.current_tol *= self.shrink_factor
-        elif acceptance_rate < self.low_rate:
-            # too few accepted, relax tolerance
-            self.current_tol *= self.expand_factor
-        # else, keep tolerance unchanged
-        return self.current_tol
+    def compute(self, inds: List[Individual], current_tol: float) -> float:
+        window_size = self.population_size + self.additional_needed_inds
+        if len(inds) < window_size:
+            return current_tol
+        recent = sorted(inds, key=lambda i: i.generation)[-window_size:]
+        accepted = [i for i in recent if i.loss < current_tol]
+        rate = len(accepted) / len(recent)
+        if rate > self.high_rate:
+            return current_tol * self.shrink_factor
+        elif rate < self.low_rate:
+            return current_tol * self.expand_factor
+        return current_tol
 
 
 class SchedulerType(Enum):
@@ -356,13 +458,14 @@ def create_scheduler(
     Parameters
     ----------
     scheduler_type : str
-        One of 'quantile', 'geometric_decay', 'acceptance_rate'.
+        One of ``'quantile'``, ``'geometric_decay'``, ``'acceptance_rate'``.
     initial_tol : float
         Starting tolerance value.
     population_size : int
-        Size of the population used for scheduling.
+        Size of the population used for scheduling decisions.
     additional_needed_inds : int
-        How many additional individuals are needed to update the tolerance.
+        Minimum extra accepted individuals beyond ``population_size`` required
+        before a tolerance update is proposed.
     **kwargs
         Additional parameters passed to the scheduler constructor.
 
