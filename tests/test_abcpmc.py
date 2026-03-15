@@ -1,7 +1,7 @@
-"""Tests for the stateless ABC propagator and tolerance schedulers.
+"""Tests for the stateless ABCPMC propagator and tolerance schedulers.
 
 All scheduler tests (Phase 1) target the new `compute(inds, current_tol)` API.
-All propagator tests (Phase 3) verify that `ABC.__call__` is fully stateless.
+All propagator tests (Phase 3) verify that `ABCPMC.__call__` is fully stateless.
 """
 import pathlib
 import random
@@ -11,11 +11,11 @@ import numpy as np
 import pytest
 
 from propulate.population import Individual
-from propulate.propagators.abc import (
-    ABC,
-    AcceptanceRateToleranceScheduler,
-    GeometricDecayToleranceScheduler,
-    QuantileToleranceScheduler,
+from propulate.propagators.abcpmc import (
+    ABCPMC,
+    AcceptanceRateScheduler,
+    GeometricDecayScheduler,
+    QuantileScheduler,
     create_scheduler,
 )
 
@@ -49,9 +49,9 @@ def make_inds(losses, tolerance=None, base_generation=0):
 # ===========================================================================
 
 
-class TestQuantileToleranceScheduler:
+class TestQuantileScheduler:
     def test_returns_current_tol_when_too_few_accepted(self):
-        sched = QuantileToleranceScheduler(
+        sched = QuantileScheduler(
             initial_tol=10.0, population_size=5, additional_needed_inds=0, percentile=50.0
         )
         inds = make_inds([1.0, 2.0, 3.0])  # only 3, need 5
@@ -59,7 +59,7 @@ class TestQuantileToleranceScheduler:
 
     def test_returns_percentile_of_accepted_losses(self):
         # k=3, additional=0 → need 3 accepted to trigger
-        sched = QuantileToleranceScheduler(
+        sched = QuantileScheduler(
             initial_tol=10.0, population_size=3, additional_needed_inds=0, percentile=50.0
         )
         inds = make_inds([1.0, 2.0, 3.0])  # all below tol=10.0 → accepted
@@ -68,7 +68,7 @@ class TestQuantileToleranceScheduler:
 
     def test_ignores_rejected_inds(self):
         # losses [1, 2, 3, 100, 200] with tol=10 → accepted=[1,2,3], 50th percentile=2
-        sched = QuantileToleranceScheduler(
+        sched = QuantileScheduler(
             initial_tol=10.0, population_size=3, additional_needed_inds=0, percentile=50.0
         )
         inds = make_inds([1.0, 2.0, 3.0, 100.0, 200.0])
@@ -77,7 +77,7 @@ class TestQuantileToleranceScheduler:
 
     def test_never_exceeds_current_tol(self):
         """Returned tolerance must be <= current_tol (monotone guarantee holds at call site)."""
-        sched = QuantileToleranceScheduler(
+        sched = QuantileScheduler(
             initial_tol=10.0, population_size=2, additional_needed_inds=0, percentile=90.0
         )
         # Even with high percentile, accepted losses are all < current_tol
@@ -87,13 +87,13 @@ class TestQuantileToleranceScheduler:
 
     def test_invalid_percentile_raises(self):
         with pytest.raises(ValueError):
-            QuantileToleranceScheduler(10.0, 5, 0, percentile=0.0)
+            QuantileScheduler(10.0, 5, 0, percentile=0.0)
         with pytest.raises(ValueError):
-            QuantileToleranceScheduler(10.0, 5, 0, percentile=100.0)
+            QuantileScheduler(10.0, 5, 0, percentile=100.0)
 
     def test_additional_needed_inds_respected(self):
         # population_size=2, additional=2 → need 4 accepted
-        sched = QuantileToleranceScheduler(
+        sched = QuantileScheduler(
             initial_tol=10.0, population_size=2, additional_needed_inds=2, percentile=50.0
         )
         inds = make_inds([1.0, 2.0, 3.0])  # 3 < 4, not enough
@@ -102,9 +102,9 @@ class TestQuantileToleranceScheduler:
         assert sched.compute(inds4, 10.0) == pytest.approx(2.5)
 
 
-class TestGeometricDecayToleranceScheduler:
+class TestGeometricDecayScheduler:
     def test_returns_initial_tol_when_too_few(self):
-        sched = GeometricDecayToleranceScheduler(
+        sched = GeometricDecayScheduler(
             initial_tol=8.0, population_size=3, additional_needed_inds=0, decay_factor=0.5
         )
         inds = make_inds([1.0, 2.0])  # 2 < 3
@@ -113,7 +113,7 @@ class TestGeometricDecayToleranceScheduler:
     def test_decays_by_factor_after_one_epoch(self):
         # k=2, additional=0, decay=0.5, initial_tol=8.0
         # 2 accepted → one epoch → tol = 4.0
-        sched = GeometricDecayToleranceScheduler(
+        sched = GeometricDecayScheduler(
             initial_tol=8.0, population_size=2, additional_needed_inds=0, decay_factor=0.5
         )
         inds = make_inds([1.0, 2.0])  # both < 8.0
@@ -123,7 +123,7 @@ class TestGeometricDecayToleranceScheduler:
         # 4 accepted inds, k=2, additional=0, decay=0.5, initial_tol=8.0
         # Epoch 1: batch=[1.0,1.5], next_tol=4.0 → both survive → tol=4.0
         # Epoch 2: batch=[1.0,1.5], next_tol=2.0 → both survive → tol=2.0
-        sched = GeometricDecayToleranceScheduler(
+        sched = GeometricDecayScheduler(
             initial_tol=8.0, population_size=2, additional_needed_inds=0, decay_factor=0.5
         )
         inds = make_inds([1.0, 1.5, 1.0, 1.5])  # all well below both thresholds
@@ -132,7 +132,7 @@ class TestGeometricDecayToleranceScheduler:
     def test_no_decay_when_too_few_survive_next_threshold(self):
         # k=3, decay=0.9, initial_tol=10.0, next_tol=9.0
         # inds have losses [8.5, 9.5, 9.8] → only 1 survives next_tol → no decay
-        sched = GeometricDecayToleranceScheduler(
+        sched = GeometricDecayScheduler(
             initial_tol=10.0, population_size=3, additional_needed_inds=0, decay_factor=0.9
         )
         inds = make_inds([8.5, 9.5, 9.8])
@@ -140,12 +140,12 @@ class TestGeometricDecayToleranceScheduler:
 
     def test_invalid_decay_factor_raises(self):
         with pytest.raises(ValueError):
-            GeometricDecayToleranceScheduler(10.0, 3, 0, decay_factor=0.0)
+            GeometricDecayScheduler(10.0, 3, 0, decay_factor=0.0)
         with pytest.raises(ValueError):
-            GeometricDecayToleranceScheduler(10.0, 3, 0, decay_factor=1.0)
+            GeometricDecayScheduler(10.0, 3, 0, decay_factor=1.0)
 
 
-class TestAcceptanceRateToleranceScheduler:
+class TestAcceptanceRateScheduler:
     def _make_sched(self, **kwargs):
         defaults = dict(
             initial_tol=1.0,
@@ -157,7 +157,7 @@ class TestAcceptanceRateToleranceScheduler:
             expand_factor=1.1,
         )
         defaults.update(kwargs)
-        return AcceptanceRateToleranceScheduler(**defaults)
+        return AcceptanceRateScheduler(**defaults)
 
     def test_tightens_when_above_high_rate(self):
         sched = self._make_sched()
@@ -187,21 +187,21 @@ class TestAcceptanceRateToleranceScheduler:
 
     def test_invalid_rates_raise(self):
         with pytest.raises(ValueError):
-            AcceptanceRateToleranceScheduler(1.0, 5, 5, low_rate=0.5, high_rate=0.3)
+            AcceptanceRateScheduler(1.0, 5, 5, low_rate=0.5, high_rate=0.3)
 
 
 class TestCreateScheduler:
     def test_create_quantile(self):
         sched = create_scheduler("quantile", 10.0, 5, 0, percentile=40.0)
-        assert isinstance(sched, QuantileToleranceScheduler)
+        assert isinstance(sched, QuantileScheduler)
 
     def test_create_geometric_decay(self):
         sched = create_scheduler("geometric_decay", 10.0, 5, 0, decay_factor=0.8)
-        assert isinstance(sched, GeometricDecayToleranceScheduler)
+        assert isinstance(sched, GeometricDecayScheduler)
 
     def test_create_acceptance_rate(self):
         sched = create_scheduler("acceptance_rate", 10.0, 5, 0)
-        assert isinstance(sched, AcceptanceRateToleranceScheduler)
+        assert isinstance(sched, AcceptanceRateScheduler)
 
     def test_invalid_type_raises(self):
         with pytest.raises(ValueError, match="Unknown scheduler type"):
@@ -209,13 +209,13 @@ class TestCreateScheduler:
 
 
 # ===========================================================================
-# Phase 3 — Stateless ABC.__call__ Tests
+# Phase 3 — Stateless ABCPMC.__call__ Tests
 # ===========================================================================
 
 
-class TestABCPriorPhase:
+class TestABCPMCPriorPhase:
     def test_samples_from_prior_when_no_inds(self):
-        abc = ABC(LIMITS, k=5, tol=10.0)
+        abc = ABCPMC(LIMITS, k=5, tol=10.0)
         child = abc(inds=[])
         for key, (lo, hi) in LIMITS.items():
             assert lo <= child[key] <= hi
@@ -223,21 +223,21 @@ class TestABCPriorPhase:
         assert child.weight == 1.0
 
     def test_samples_from_prior_when_archive_below_k(self):
-        abc = ABC(LIMITS, k=5, tol=10.0)
+        abc = ABCPMC(LIMITS, k=5, tol=10.0)
         inds = make_inds([1.0, 2.0, 3.0])  # 3 < k=5
         child = abc(inds=inds)
         assert child.weight == 1.0
         assert child.loss == float("inf")
 
     def test_prior_sample_within_limits(self):
-        abc = ABC(LIMITS, k=3, tol=10.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
         for _ in range(20):
             child = abc(inds=[])
             for key, (lo, hi) in LIMITS.items():
                 assert lo <= child[key] <= hi
 
 
-class TestABCStateless:
+class TestABCPMCStateless:
     def _build_archive(self, n=10, max_loss=1.0, tol=2.0):
         """Build n evaluated inds with loss < max_loss and tolerance=tol stored."""
         inds = []
@@ -247,9 +247,9 @@ class TestABCStateless:
         return inds
 
     def test_self_tol_not_mutated(self):
-        """ABC.tol (initial_tol) must never change between calls."""
-        abc = ABC(LIMITS, k=5, tol=10.0, scheduler_type="quantile",
-                  additional_needed_inds=0, percentile=50.0)
+        """ABCPMC.tol (initial_tol) must never change between calls."""
+        abc = ABCPMC(LIMITS, k=5, tol=10.0, scheduler_type="quantile",
+                     additional_needed_inds=0, percentile=50.0)
         initial = abc.tol
         inds = self._build_archive(n=20, max_loss=9.0, tol=10.0)
         abc(inds=inds)
@@ -260,21 +260,21 @@ class TestABCStateless:
         """Child tolerance should be <= the minimum stored tolerance in history."""
         # k=3, 7 inds with loss in [0.1..0.7] and stored tolerance=5.0.
         # percentile=90 of accepted → ~0.64; archive = inds with loss<0.64 → 6 >= k=3.
-        abc = ABC(LIMITS, k=3, tol=100.0, scheduler_type="quantile",
-                  additional_needed_inds=0, percentile=90.0)
+        abc = ABCPMC(LIMITS, k=3, tol=100.0, scheduler_type="quantile",
+                     additional_needed_inds=0, percentile=90.0)
         inds = [make_ind(loss=0.1 * i, tolerance=5.0, generation=i) for i in range(1, 8)]
         child = abc(inds=inds)
         assert child.tolerance is not None
         assert child.tolerance <= 5.0
 
     def test_child_has_tolerance_set(self):
-        abc = ABC(LIMITS, k=5, tol=10.0)
+        abc = ABCPMC(LIMITS, k=5, tol=10.0)
         inds = self._build_archive(n=10, max_loss=9.0, tol=10.0)
         child = abc(inds=inds)
         assert child.tolerance is not None
 
     def test_child_has_positive_weight(self):
-        abc = ABC(LIMITS, k=5, tol=10.0)
+        abc = ABCPMC(LIMITS, k=5, tol=10.0)
         inds = self._build_archive(n=10, max_loss=9.0, tol=10.0)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -282,7 +282,7 @@ class TestABCStateless:
         assert child.weight > 0
 
     def test_child_position_within_limits(self):
-        abc = ABC(LIMITS, k=5, tol=10.0)
+        abc = ABCPMC(LIMITS, k=5, tol=10.0)
         inds = self._build_archive(n=10, max_loss=9.0, tol=10.0)
         lo = np.array([v[0] for v in LIMITS.values()])
         hi = np.array([v[1] for v in LIMITS.values()])
@@ -293,8 +293,8 @@ class TestABCStateless:
 
     def test_tolerance_monotone_across_calls(self):
         """Effective tolerance (child.tolerance) must be non-increasing."""
-        abc = ABC(LIMITS, k=3, tol=10.0, scheduler_type="quantile",
-                  additional_needed_inds=0, percentile=30.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, scheduler_type="quantile",
+                     additional_needed_inds=0, percentile=30.0)
         history = []
         prev_tol = float("inf")
         for step in range(15):
@@ -309,8 +309,8 @@ class TestABCStateless:
         """Two propagators with same seed produce same output from same history."""
         rng1 = random.Random(0)
         rng2 = random.Random(0)
-        abc1 = ABC(LIMITS, k=5, tol=10.0, rng=rng1)
-        abc2 = ABC(LIMITS, k=5, tol=10.0, rng=rng2)
+        abc1 = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng1)
+        abc2 = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng2)
         # Fix numpy RNG seeds too
         abc1.rng_np = np.random.default_rng(42)
         abc2.rng_np = np.random.default_rng(42)
@@ -320,10 +320,10 @@ class TestABCStateless:
         np.testing.assert_array_almost_equal(child1.position, child2.position)
 
 
-class TestABCEdgeCases:
+class TestABCPMCEdgeCases:
     def test_degenerate_archive_all_same_position(self):
         """Zero-covariance archive must not raise; jitter handles it."""
-        abc = ABC(LIMITS, k=3, tol=10.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
         inds = []
         for i in range(5):
             ind = Individual({"x": 0.5, "y": 0.5}, LIMITS, tolerance=10.0, generation=i)
@@ -334,26 +334,26 @@ class TestABCEdgeCases:
         assert child is not None
 
     def test_child_is_individual(self):
-        abc = ABC(LIMITS, k=3, tol=10.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
         child = abc(inds=inds)
         assert isinstance(child, Individual)
 
     def test_integer_limits_raise(self):
         with pytest.raises(ValueError, match="continuous"):
-            ABC({"x": (0, 10), "y": (0.0, 1.0)})
+            ABCPMC({"x": (0, 10), "y": (0.0, 1.0)})
 
 
 class TestFilterByTolerance:
     def test_pure_function_with_explicit_tol(self):
-        abc = ABC(LIMITS, k=3, tol=10.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
         inds = make_inds([1.0, 5.0, 15.0, 20.0])
         result = abc.filter_by_tolerance(inds, tol=10.0)
         assert len(result) == 2
         assert all(ind.loss < 10.0 for ind in result)
 
     def test_no_side_effects(self):
-        abc = ABC(LIMITS, k=3, tol=10.0)
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
         inds = make_inds([1.0, 5.0, 15.0])
         _ = abc.filter_by_tolerance(inds, tol=10.0)
         assert abc.tol == 10.0  # unchanged
@@ -368,11 +368,11 @@ try:
     from propulate import Propulator
 
     @pytest.mark.mpi
-    def test_abc_propulator_runs(mpi_tmp_path: pathlib.Path) -> None:
-        """End-to-end: ABC runs via Propulator on 2D sphere without crash."""
+    def test_abcpmc_propulator_runs(mpi_tmp_path: pathlib.Path) -> None:
+        """End-to-end: ABCPMC runs via Propulator on 2D sphere without crash."""
         limits = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
         rng = random.Random(42 + MPI.COMM_WORLD.rank)
-        propagator = ABC(
+        propagator = ABCPMC(
             limits,
             k=5,
             tol=1.0,

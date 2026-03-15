@@ -1,8 +1,7 @@
 import logging
 import random
 import warnings
-from abc import ABC as AbstractBase
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -15,9 +14,9 @@ from .base import Propagator
 logger = logging.getLogger(__name__)
 
 
-class ABC(Propagator):
+class ABCPMC(Propagator):
     """
-    Steady-state asynchronous ABC propagator.
+    Steady-state asynchronous ABC-PMC propagator.
 
     The algorithm is fully stateless: all algorithm state (effective tolerance,
     active archive) is reconstructed from the evaluated-history list ``inds``
@@ -56,7 +55,7 @@ class ABC(Propagator):
         **kwargs: Dict[str, Union[float, int, str]],
     ) -> None:
         """
-        Initialize the ABC propagator.
+        Initialize the ABCPMC propagator.
 
         Parameters
         ----------
@@ -99,7 +98,7 @@ class ABC(Propagator):
         # Uniform prior density = 1 / volume (float limits only)
         float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], float)}
         if len(float_limits) != len(self.limits):
-            raise ValueError("ABC requires all search-space limits to be continuous (float) intervals.")
+            raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
 
@@ -262,7 +261,7 @@ class ABC(Propagator):
         denom = float(np.dot(weights, pdfs))
         if denom == 0:
             warnings.warn(
-                "ABC: importance weight denominator is zero (child is outside kernel support). "
+                "ABCPMC: importance weight denominator is zero (child is outside kernel support). "
                 "Assigning fallback weight; consider re-sampling.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -273,7 +272,7 @@ class ABC(Propagator):
         return child
 
 
-class ToleranceScheduler(AbstractBase):
+class EpsilonScheduler(ABC):
     """
     Base class for tolerance scheduling in ABC-PMC.
 
@@ -304,7 +303,7 @@ class ToleranceScheduler(AbstractBase):
         Returns
         -------
         float
-            Proposed new tolerance.  The caller (``ABC.__call__``) enforces
+            Proposed new tolerance.  The caller (``ABCPMC.__call__``) enforces
             the monotone guarantee via ``min(current_tol, proposed)``.
         """
         ...
@@ -316,7 +315,7 @@ class ToleranceScheduler(AbstractBase):
     ) -> float:
         """Deprecated. Use ``compute(inds, current_tol)`` instead."""
         warnings.warn(
-            "ToleranceScheduler.update() is deprecated and will be removed in a future release. "
+            "EpsilonScheduler.update() is deprecated and will be removed in a future release. "
             "Use compute(inds, current_tol) instead.",
             DeprecationWarning,
             stacklevel=2,
@@ -329,7 +328,7 @@ class ToleranceScheduler(AbstractBase):
         return self.current_tol
 
 
-class QuantileToleranceScheduler(ToleranceScheduler):
+class QuantileScheduler(EpsilonScheduler):
     """
     Shrinks tolerance to a given percentile of the losses of *accepted* individuals.
 
@@ -358,7 +357,7 @@ class QuantileToleranceScheduler(ToleranceScheduler):
         return float(np.percentile(losses, self.percentile))
 
 
-class GeometricDecayToleranceScheduler(ToleranceScheduler):
+class GeometricDecayScheduler(EpsilonScheduler):
     """
     Shrinks tolerance by a fixed multiplicative factor per completed epoch.
 
@@ -402,7 +401,7 @@ class GeometricDecayToleranceScheduler(ToleranceScheduler):
         return tol
 
 
-class AcceptanceRateToleranceScheduler(ToleranceScheduler):
+class AcceptanceRateScheduler(EpsilonScheduler):
     """
     Adjusts tolerance based on the acceptance rate in a recent sliding window.
 
@@ -443,7 +442,7 @@ class AcceptanceRateToleranceScheduler(ToleranceScheduler):
         return current_tol
 
 
-class SchedulerType(Enum):
+class EpsilonSchedulerType(Enum):
     QUANTILE = "quantile"
     GEOMETRIC_DECAY = "geometric_decay"
     ACCEPTANCE_RATE = "acceptance_rate"
@@ -451,7 +450,7 @@ class SchedulerType(Enum):
 
 def create_scheduler(
     scheduler_type: str, initial_tol: float, population_size: int, additional_needed_inds: int, **kwargs
-) -> ToleranceScheduler:
+) -> EpsilonScheduler:
     """
     Factory to create a tolerance scheduler by name.
 
@@ -471,18 +470,18 @@ def create_scheduler(
 
     Returns
     -------
-    ToleranceScheduler
+    EpsilonScheduler
         An instance of the requested scheduler.
     """
     try:
-        st = SchedulerType(scheduler_type)
+        st = EpsilonSchedulerType(scheduler_type)
     except ValueError:
-        valid = [e.value for e in SchedulerType]
+        valid = [e.value for e in EpsilonSchedulerType]
         raise ValueError(f"Unknown scheduler type '{scheduler_type}'. Valid types: {valid}")
 
-    if st == SchedulerType.QUANTILE:
-        return QuantileToleranceScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
-    elif st == SchedulerType.GEOMETRIC_DECAY:
-        return GeometricDecayToleranceScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
-    elif st == SchedulerType.ACCEPTANCE_RATE:
-        return AcceptanceRateToleranceScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+    if st == EpsilonSchedulerType.QUANTILE:
+        return QuantileScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+    elif st == EpsilonSchedulerType.GEOMETRIC_DECAY:
+        return GeometricDecayScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+    elif st == EpsilonSchedulerType.ACCEPTANCE_RATE:
+        return AcceptanceRateScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)

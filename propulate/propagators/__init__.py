@@ -1,6 +1,14 @@
 """This package bundles all classes that are used as propagators in Propulate's optimization routine."""
 
-from .abc import ABC
+from .abcpmc import (
+    ABCPMC,
+    AcceptanceRateScheduler,
+    EpsilonScheduler,
+    EpsilonSchedulerType,
+    GeometricDecayScheduler,
+    QuantileScheduler,
+    create_scheduler,
+)
 from .base import (
     Compose,
     Conditional,
@@ -91,5 +99,11 @@ __all__ = [
     "SingleCPUFitter",
     "create_fitter",
     "get_default_kernel_sklearn",
-    "ABC",
+    "ABCPMC",
+    "EpsilonScheduler",
+    "QuantileScheduler",
+    "GeometricDecayScheduler",
+    "AcceptanceRateScheduler",
+    "EpsilonSchedulerType",
+    "create_scheduler",
 ]

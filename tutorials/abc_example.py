@@ -4,7 +4,7 @@ import random
 from mpi4py import MPI
 
 from propulate import Propulator
-from propulate.propagators.abc import ABC
+from propulate.propagators.abcpmc import ABCPMC
 from propulate.utils import set_logger_config
 from propulate.utils.benchmark_functions import (
     get_function_search_space,
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     # low = np.array([v[0] for v in limits.values()])
     # high = np.array([v[1] for v in limits.values()])
     # start_point = np.random.default_rng(seed=config.seed + 235231).uniform(low=low, high=high)
-    propagator = ABC(loss_fn=function, limits=limits)
+    propagator = ABCPMC(loss_fn=function, limits=limits)
     # Set up Propulator performing actual optimization.
     propulator = Propulator(
         loss_fn=function,
