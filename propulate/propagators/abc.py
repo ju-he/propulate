@@ -1,12 +1,17 @@
+import logging
+import warnings
+from abc import ABC as AbstractBase
+from abc import abstractmethod
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
 import numpy as np
-from pyparsing import abstractmethod
 from scipy.stats import multivariate_normal
 
 from ..population import Individual
 from .base import Propagator
+
+logger = logging.getLogger(__name__)
 
 
 class ABC(Propagator):
@@ -33,8 +38,6 @@ class ABC(Propagator):
 
         Parameters
         ----------
-        loss_fn : Union[Callable, Generator[float, None, None]]
-            The loss function to be minimized.
         limits : Dict
             Search-space limits for each gene.
         perturbation_scale : float
@@ -52,6 +55,7 @@ class ABC(Propagator):
             Additional parameters for the scheduler, such as percentile for quantile scheduling,
             decay factor for geometric decay, or low/high rates for acceptance rate scheduling.
         """
+        super().__init__(-1, 1)
         self.limits = limits
         self.perturbation_scale = perturbation_scale
         self.k = k
@@ -61,8 +65,12 @@ class ABC(Propagator):
         else:
             self.additional_needed_inds = additional_needed_inds
         self.tolerance_scheduler = create_scheduler(scheduler_type, tol, k, self.additional_needed_inds, **kwargs)
-        # compute uniform prior density = 1 / volume
-        volumes = [(hi - lo) for lo, hi in self.limits.values()]
+        self.rng_np = np.random.default_rng()
+        # compute uniform prior density = 1 / volume (float limits only)
+        float_limits = {k: v for k, v in self.limits.items() if isinstance(v[0], float)}
+        if len(float_limits) != len(self.limits):
+            raise ValueError("ABC requires all search-space limits to be continuous (float) intervals.")
+        volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
 
     def filter_by_tolerance(self, inds) -> List[Individual]:
@@ -142,7 +150,7 @@ class ABC(Propagator):
         if len(usable_pop) < self.k:
             sample = {}
             for key, limit in self.limits.items():
-                sample[key] = np.random.uniform(limit[0], limit[1])
+                sample[key] = self.rng.uniform(limit[0], limit[1])
             child = Individual(position=sample, limits=self.limits)
             child.weight = 1.0
             return child
@@ -150,8 +158,8 @@ class ABC(Propagator):
         # Update tolerance based on the scheduler for next generation
         self.tol = self.tolerance_scheduler.update(usable_pop, inds)
 
-        # Select k newest individuals
-        working_pop = usable_pop[-self.k :]
+        # Select k most recent individuals (sorted by generation to ensure temporal order)
+        working_pop = sorted(usable_pop, key=lambda ind: ind.generation)[-self.k :]
 
         weights = np.array([ind.weight for ind in working_pop], dtype=float)
         weights /= weights.sum()  # normalize
@@ -160,18 +168,21 @@ class ABC(Propagator):
         cov = self.weighted_covariance(positions, weights)
         cov += 1e-6 * np.eye(positions.shape[1])
         kernel_cov = self.perturbation_scale * cov
-
-        kernel_cov = self.perturbation_scale * cov
         # ensure true SPD
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
         eigs = np.linalg.eigvalsh(kernel_cov)
         if eigs.min() <= 0:
             kernel_cov += (-eigs.min() + 1e-8) * np.eye(positions.shape[1])
 
-        idx = np.random.choice(len(working_pop), p=weights)
+        idx = self.rng.choices(range(len(working_pop)), weights=weights.tolist())[0]
         parent = working_pop[idx]
 
-        candidate_pos = parent.position + np.random.multivariate_normal(mean=np.zeros(positions.shape[1]), cov=kernel_cov)
+        candidate_pos = parent.position + self.rng_np.multivariate_normal(mean=np.zeros(positions.shape[1]), cov=kernel_cov)
+
+        # Clip candidate to search-space bounds
+        lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
+        hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
+        candidate_pos = np.clip(candidate_pos, lo, hi)
 
         child = Individual(position=candidate_pos, limits=self.limits)
         child.tolerance = self.tol
@@ -186,21 +197,21 @@ class ABC(Propagator):
                 )
             pdfs.append(p)
 
-        # pdfs = [
-        #     multivariate_normal.pdf(child.position, mean=wp.position, cov=kernel_cov)
-        #     for wp in working_pop
-        # ]
         denom = float(np.dot(weights, pdfs))
         if denom == 0:
-            # If denominator is zero, we cannot compute a valid weight
-            # This can happen if all pdfs are zero (e.g., child is outside limits)
+            warnings.warn(
+                "ABC: importance weight denominator is zero (child is outside kernel support). "
+                "Assigning fallback weight; consider re-sampling.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             denom = 1e-12
         child.weight = self.prior_density / denom
 
         return child
 
 
-class ToleranceScheduler(ABC):
+class ToleranceScheduler(AbstractBase):
     """
     Base class for tolerance scheduling in ABC-PMC.
 
@@ -214,14 +225,8 @@ class ToleranceScheduler(ABC):
         self.additional_needed_inds = additional_needed_inds  # how often to update tolerance
 
     def condition_fulfilled(self, accepted_inds: List[Individual]) -> bool:
-        """
-        Increment the internal call counter, and only
-        return True every self.update_interval calls.
-        """
-        if len(accepted_inds) >= self.population_size + self.additional_needed_inds:
-            self._call_count = 0
-            return True
-        return False
+        """Return True when enough new individuals have accumulated to warrant a tolerance update."""
+        return len(accepted_inds) >= self.population_size + self.additional_needed_inds
 
     @abstractmethod
     def update(self, accepted_inds: Optional[List[Individual]] = None, all_inds: Optional[List[Individual]] = None) -> float:
@@ -282,7 +287,9 @@ class GeometricDecayToleranceScheduler(ToleranceScheduler):
     def update(self, accepted_inds: List[Individual], all_inds: Optional[List[Individual]] = None) -> float:
         # ignore all_inds
         if accepted_inds is None or len(accepted_inds) == 0:
-            raise ValueError("`accepted_inds` must be a non-empty list for quantile scheduling.")
+            raise ValueError("`accepted_inds` must be a non-empty list for geometric decay scheduling.")
+        if not self.condition_fulfilled(accepted_inds):
+            return self.current_tol
         next_tol = self.decay_factor * self.current_tol
         if len([ind for ind in accepted_inds if ind.loss < next_tol]) >= self.population_size:
             # if enough individuals accepted, shrink tolerance
