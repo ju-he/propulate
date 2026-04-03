@@ -7,11 +7,99 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 from scipy.stats import multivariate_normal
+from sortedcontainers import SortedKeyList
 
 from ..population import Individual
 from .base import Propagator
 
 logger = logging.getLogger(__name__)
+
+
+class _IncrementalCache:
+    """
+    Performance cache for ``ABCPMC.__call__``.
+
+    Maintains sorted views of the evaluated history, updated incrementally as
+    new individuals arrive (O(log N) per update).  Falls back to a full rebuild
+    (O(N log N)) when the history doesn't grow by exactly the expected amount
+    (e.g. after crash recovery or when multiple evaluations arrive at once).
+
+    This is a *transparent optimisation*: identical results are produced whether
+    the cache is hit or rebuilt.
+    """
+
+    __slots__ = (
+        "history_len",
+        "tol_from_history",
+        "_accepted_by_loss",
+        "_by_gen",
+        "_accepted_by_gen",
+        "_initial_tol",
+    )
+
+    def __init__(self, initial_tol: float) -> None:
+        self.history_len: int = -1  # sentinel: no history processed yet
+        self.tol_from_history: float = initial_tol
+        self._accepted_by_loss: SortedKeyList = SortedKeyList(key=lambda ind: ind.loss)
+        self._by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
+        self._accepted_by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
+        self._initial_tol: float = initial_tol
+
+    # -- full rebuild (fallback) -----------------------------------------------
+
+    def rebuild(self, inds, initial_tol: float) -> None:
+        """Reconstruct all cached state from scratch.  O(N log N)."""
+        self._initial_tol = initial_tol
+        self.history_len = len(inds)
+
+        # tol_from_history
+        tols = [ind.tolerance for ind in inds if ind.tolerance is not None]
+        self.tol_from_history = min(tols) if tols else initial_tol
+
+        # All inds sorted by loss for tolerance-threshold queries.
+        self._accepted_by_loss = SortedKeyList(inds, key=lambda ind: ind.loss)
+
+        # All inds sorted by generation
+        self._by_gen = SortedKeyList(inds, key=lambda ind: ind.generation)
+
+        # Accepted at initial_tol, sorted by generation
+        acc_gen = [ind for ind in inds if ind.loss < initial_tol]
+        self._accepted_by_gen = SortedKeyList(acc_gen, key=lambda ind: ind.generation)
+
+    # -- incremental update ----------------------------------------------------
+
+    def update(self, new_ind) -> None:
+        """Process one new evaluated individual.  Amortised O(log N)."""
+        self.history_len += 1
+
+        # Update tol_from_history (running minimum)
+        if new_ind.tolerance is not None and new_ind.tolerance < self.tol_from_history:
+            self.tol_from_history = new_ind.tolerance
+
+        self._accepted_by_loss.add(new_ind)
+
+        # Insert into inds-by-generation
+        self._by_gen.add(new_ind)
+
+        # Insert into accepted-by-generation (for GeometricDecayScheduler)
+        if new_ind.loss < self._initial_tol:
+            self._accepted_by_gen.add(new_ind)
+
+    # -- query methods ---------------------------------------------------------
+
+    @property
+    def n_accepted(self) -> int:
+        """Number of accepted individuals at the current tolerance."""
+        return self._accepted_by_loss.bisect_key_left(self.tol_from_history)
+
+    def count_below(self, tol: float) -> int:
+        """Count accepted individuals with loss strictly below *tol*."""
+        return self._accepted_by_loss.bisect_key_left(tol)
+
+    def get_archive(self, tol: float, k: int) -> list:
+        """Return top-*k* individuals with loss < *tol*, sorted by loss."""
+        n = self._accepted_by_loss.bisect_key_left(tol)
+        return list(self._accepted_by_loss[: min(n, k)])
 
 
 class ABCPMC(Propagator):
@@ -20,9 +108,10 @@ class ABCPMC(Propagator):
 
     The algorithm is fully stateless: all algorithm state (effective tolerance,
     active archive) is reconstructed from the evaluated-history list ``inds``
-    passed to ``__call__`` on every invocation.  No mutable instance variables
-    are modified after construction, making the propagator safe for asynchronous
-    HPC execution without synchronization barriers.
+    passed to ``__call__`` on every invocation. Internal caches may be updated
+    as a performance optimization, but they do not carry algorithmic state.
+    This requires ``inds`` to be append-only: previously seen ``Individual``
+    instances must not be mutated in place or reordered between calls.
 
     Tolerance memory is carried by each proposed ``Individual`` via the
     ``Individual.tolerance`` field.  The effective tolerance at any call is
@@ -52,6 +141,8 @@ class ABCPMC(Propagator):
     :class:`Propagator` : The parent class.
     """
 
+    _MAX_RESAMPLE_ATTEMPTS = 1000
+
     def __init__(
         self,
         limits: Dict,
@@ -60,6 +151,7 @@ class ABCPMC(Propagator):
         tol: float = 600.0,
         scheduler_type: str = "acceptance_rate",
         additional_needed_inds: Optional[int] = None,
+        min_tol: Optional[float] = None,
         rng: Optional[random.Random] = None,
         **kwargs: Union[float, int, str],
     ) -> None:
@@ -86,6 +178,9 @@ class ABCPMC(Propagator):
             the scheduler proposes a tolerance update.  Defaults to ``k``.
         rng : random.Random, optional
             Random number generator forwarded to the base ``Propagator``.
+        min_tol : float, optional
+            Lower bound applied to the effective tolerance after scheduler
+            proposals and fallback reconstruction.
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -96,6 +191,9 @@ class ABCPMC(Propagator):
         self.perturbation_scale = perturbation_scale
         self.k = k
         self.tol = tol  # read-only initial tolerance; never mutated
+        if min_tol is not None and min_tol < 0:
+            raise ValueError("min_tol must be >= 0.")
+        self.min_tol = min_tol
         if additional_needed_inds is None:
             self.additional_needed_inds = k
         else:
@@ -103,13 +201,30 @@ class ABCPMC(Propagator):
         self.tolerance_scheduler = create_scheduler(
             scheduler_type, tol, k, self.additional_needed_inds, **kwargs
         )
-        self.rng_np = np.random.default_rng(rng.getrandbits(128) if rng is not None else None)
+        self.rng_np = np.random.default_rng(
+            self.rng.getrandbits(128)
+        )  # Derive NumPy seed from Propagator RNG
         # Uniform prior density = 1 / volume (float limits only)
-        float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], float)}
+        float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], (float, np.floating))}
         if len(float_limits) != len(self.limits):
             raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
+        self._cache = _IncrementalCache(self.tol)
+
+    def _update_cache(self, inds: List[Individual]) -> None:
+        """Incrementally update the internal performance cache."""
+        n = len(inds)
+        cached_len = self._cache.history_len
+        if cached_len < 0 or n < cached_len:
+            # First call or history shrunk — full rebuild
+            self._cache.rebuild(inds, self.tol)
+            self.tolerance_scheduler.reset_cache()
+        elif n > cached_len:
+            # New individuals — process incrementally
+            for new_ind in inds[cached_len:]:
+                self._cache.update(new_ind)
+        # n == cached_len: no change, use cached state as-is
 
     def filter_by_tolerance(self, inds: List[Individual], tol: float) -> List[Individual]:
         """
@@ -205,32 +320,41 @@ class ABCPMC(Propagator):
         Individual
             The next candidate (unevaluated, ``loss == inf``).
         """
-        # 1. Reconstruct effective tolerance from stamped history
-        tol_from_history = min(
-            (ind.tolerance for ind in inds if ind.tolerance is not None),
-            default=self.tol,
-        )
+        # 1. Update incremental cache; reconstructs tol_from_history.
+        self._update_cache(inds)
+        tol_from_history = self._cache.tol_from_history
+        current_tol = tol_from_history
+        if self.min_tol is not None:
+            current_tol = max(current_tol, self.min_tol)
 
         # 2. Prior-phase guard: check archive BEFORE calling scheduler to avoid
         #    premature tolerance tightening that could oscillate the archive below k.
-        preliminary_archive = self.select_archive(inds, tol_from_history)
-        if len(preliminary_archive) < self.k:
+        if self._cache.count_below(current_tol) < self.k:
             sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
             child = Individual(position=sample, limits=self.limits)
             child.weight = 1.0
             return child
 
         # 3. Archive is full — safe to call scheduler and propose a tighter tolerance
-        proposed_tol = self.tolerance_scheduler.compute(inds, tol_from_history)
-        candidate_tol = min(tol_from_history, proposed_tol)  # monotone guarantee
+        proposed_tol = self.tolerance_scheduler.compute_cached(
+            inds, current_tol,
+            self._cache._accepted_by_loss,
+            self._cache._by_gen,
+            self._cache._accepted_by_gen,
+        )
+        candidate_tol = min(current_tol, proposed_tol)  # monotone guarantee
+        if self.min_tol is not None:
+            candidate_tol = max(candidate_tol, self.min_tol)
 
         # 4. Accept tighter tolerance only if the archive remains full; otherwise hold
-        if len(self.select_archive(inds, candidate_tol)) >= self.k:
+        if self._cache.count_below(candidate_tol) >= self.k:
             effective_tol = candidate_tol
-            archive = self.select_archive(inds, effective_tol)
         else:
-            effective_tol = tol_from_history
-            archive = preliminary_archive  # reuse; avoids redundant sort
+            effective_tol = current_tol
+        if self.min_tol is not None:
+            effective_tol = max(effective_tol, self.min_tol)
+
+        archive = self._cache.get_archive(effective_tol, self.k)
 
         # 5. Build perturbation kernel from archive
         _raw_weights = []
@@ -265,10 +389,19 @@ class ABCPMC(Propagator):
 
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
-        candidate_pos = parent.position + self.rng_np.multivariate_normal(
-            mean=np.zeros(positions.shape[1]), cov=kernel_cov
-        )
-        candidate_pos = np.clip(candidate_pos, lo, hi)
+        candidate_pos = parent.position
+        for _attempt in range(self._MAX_RESAMPLE_ATTEMPTS):
+            candidate_pos = parent.position + self.rng_np.multivariate_normal(
+                mean=np.zeros(positions.shape[1]), cov=kernel_cov
+            )
+            if np.all(candidate_pos >= lo) and np.all(candidate_pos <= hi):
+                break
+        else:
+            candidate_pos = np.clip(candidate_pos, lo, hi)
+            logger.debug(
+                "ABCPMC: reject-resample exhausted %d attempts; falling back to boundary clipping.",
+                self._MAX_RESAMPLE_ATTEMPTS,
+            )
 
         child = Individual(position=candidate_pos, limits=self.limits)
         child.tolerance = effective_tol  # stamped for future history reconstruction
@@ -278,19 +411,18 @@ class ABCPMC(Propagator):
         for wp in archive:
             try:
                 p = multivariate_normal.pdf(
-                    child.position, mean=wp.position, cov=kernel_cov, allow_singular=True
+                    child.position, mean=wp.position, cov=kernel_cov
                 )
             except np.linalg.LinAlgError:
                 p = multivariate_normal.pdf(
                     child.position,
                     mean=wp.position,
                     cov=kernel_cov + 1e-6 * np.eye(positions.shape[1]),
-                    allow_singular=True,
                 )
             pdfs.append(p)
 
         denom = float(np.dot(weights, pdfs))
-        if denom == 0:
+        if denom < 1e-12:
             warnings.warn(
                 "ABCPMC: importance weight denominator is zero (child is outside kernel support). "
                 "Assigning fallback weight; consider re-sampling.",
@@ -310,7 +442,10 @@ class EpsilonScheduler(ABC):
     Subclasses must implement ``compute(inds, current_tol)`` — a **pure function**
     of the evaluated history and the current effective tolerance.  No mutable
     state should be modified by ``compute``; all scheduling logic must be
-    derivable from ``inds`` alone.
+    derivable from ``inds`` alone. Subclasses may additionally override
+    ``compute_cached(...)`` to exploit append-only history with internal
+    performance caches, but that cached path must remain equivalent to
+    ``compute(...)`` for valid inputs.
     """
 
     def __init__(self, initial_tol: float, population_size: int, additional_needed_inds: int):
@@ -338,6 +473,27 @@ class EpsilonScheduler(ABC):
             the monotone guarantee via ``min(current_tol, proposed)``.
         """
         ...
+
+    def compute_cached(
+        self,
+        inds: List[Individual],
+        current_tol: float,
+        accepted_by_loss: list,
+        inds_by_gen: list,
+        accepted_by_gen: list,
+    ) -> float:
+        """
+        Compute using pre-built cached data.
+
+        Subclasses override this for O(1) fast paths.  The default
+        implementation ignores the cached data and delegates to
+        :meth:`compute`, so external schedulers work unchanged.
+        """
+        return self.compute(inds, current_tol)
+
+    def reset_cache(self) -> None:
+        """Reset internal performance caches (called on full history rebuild)."""
+        pass
 
     def update(
         self,
@@ -387,6 +543,12 @@ class QuantileScheduler(EpsilonScheduler):
         losses = [ind.loss for ind in accepted]
         return float(np.percentile(losses, self.percentile))
 
+    def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        n = accepted_by_loss.bisect_key_left(current_tol)
+        if n < self.population_size + self.additional_needed_inds:
+            return current_tol
+        return float(np.percentile([ind.loss for ind in accepted_by_loss[:n]], self.percentile))
+
 
 class GeometricDecayScheduler(EpsilonScheduler):
     """
@@ -398,8 +560,10 @@ class GeometricDecayScheduler(EpsilonScheduler):
     ``initial_tol * decay_factor^n``, but only if enough individuals in each
     batch survive the tightened threshold.
 
-    The reconstruction is fully stateless: epoch count is derived from the
-    length of accepted history divided by the batch size.
+    The tolerance reconstruction is derived from the accepted history divided
+    into batches by generation order. The cached fast path maintains
+    incremental bookkeeping for append-only histories but must remain
+    equivalent to a full replay from history.
     """
 
     def __init__(
@@ -413,6 +577,8 @@ class GeometricDecayScheduler(EpsilonScheduler):
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
         self.decay_factor = decay_factor
+        self._cached_consumed = 0
+        self._cached_tol = initial_tol
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         """
@@ -452,6 +618,25 @@ class GeometricDecayScheduler(EpsilonScheduler):
                 tol = next_tol
             consumed += batch_size
         return tol
+
+    def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        batch_size = self.population_size + self.additional_needed_inds
+        tol = self._cached_tol
+        consumed = self._cached_consumed
+        while consumed + batch_size <= len(accepted_by_gen):
+            batch = accepted_by_gen[consumed : consumed + batch_size]
+            next_tol = self.decay_factor * tol
+            surviving = [i for i in batch if i.loss < next_tol]
+            if len(surviving) >= self.population_size:
+                tol = next_tol
+            consumed += batch_size
+        self._cached_consumed = consumed
+        self._cached_tol = tol
+        return tol
+
+    def reset_cache(self) -> None:
+        self._cached_consumed = 0
+        self._cached_tol = self.initial_tol
 
 
 class AcceptanceRateScheduler(EpsilonScheduler):
@@ -496,6 +681,17 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         recent = sorted(inds, key=lambda i: i.generation)[-window_size:]
         accepted = [i for i in recent if i.loss < current_tol]
         rate = len(accepted) / len(recent)
+        if rate > self.high_rate:
+            return current_tol * self.shrink_factor
+        return current_tol
+
+    def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        window_size = self.population_size + self.additional_needed_inds
+        if len(inds_by_gen) < window_size:
+            return current_tol
+        recent = inds_by_gen[-window_size:]
+        accepted = sum(1 for i in recent if i.loss < current_tol)
+        rate = accepted / len(recent)
         if rate > self.high_rate:
             return current_tol * self.shrink_factor
         return current_tol

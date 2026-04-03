@@ -29,6 +29,7 @@ dependencies = [
     "h5py",
     "scikit-learn",
     "scipy",
+    "sortedcontainers",
 ]
 
 [project.optional-dependencies]

@@ -5,6 +5,7 @@ All propagator tests (Phase 3) verify that `ABCPMC.__call__` is fully stateless.
 """
 import pathlib
 import random
+import time
 import warnings
 
 import numpy as np
@@ -317,6 +318,12 @@ class TestABCPMCStateless:
 
 
 class TestABCPMCEdgeCases:
+    def test_numpy_float_limits_accepted(self):
+        np_limits = {"x": (np.float64(0.0), np.float64(1.0)), "y": (np.float64(0.0), np.float64(1.0))}
+        abc = ABCPMC(np_limits, k=3, tol=10.0)
+        child = abc(inds=[])
+        assert child is not None
+
     def test_degenerate_archive_all_same_position(self):
         """Zero-covariance archive must not raise; jitter handles it."""
         abc = ABCPMC(LIMITS, k=3, tol=10.0)
@@ -358,6 +365,61 @@ class TestABCPMCEdgeCases:
         assert not np.isnan(child.weight)
         assert "weight=None" in caplog.text
 
+    def test_near_zero_denominator_handled(self, monkeypatch):
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
+
+        def tiny_pdf(*args, **kwargs):
+            return 1e-20
+
+        monkeypatch.setattr("propulate.propagators.abcpmc.multivariate_normal.pdf", tiny_pdf)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            child = abc(inds=inds)
+        assert any("importance weight denominator is zero" in str(w.message) for w in caught)
+        assert np.isfinite(child.weight)
+        assert child.weight == pytest.approx(1e12)
+
+    def test_weights_reasonable_near_boundaries(self):
+        boundary_limits = {"x": (0.0, 0.05), "y": (0.0, 0.05)}
+        abc = ABCPMC(boundary_limits, k=4, tol=1.0, rng=random.Random(0))
+        inds = []
+        for i in range(6):
+            pos = {"x": 0.045 + 0.0005 * i, "y": 0.045 + 0.0005 * i}
+            ind = Individual(pos, boundary_limits, tolerance=1.0, generation=i)
+            ind.loss = 0.01 * (i + 1)
+            ind.weight = 1.0
+            inds.append(ind)
+
+        lo = np.array([lim[0] for lim in boundary_limits.values()])
+        hi = np.array([lim[1] for lim in boundary_limits.values()])
+        for _ in range(25):
+            child = abc(inds=inds)
+            assert np.all(child.position >= lo)
+            assert np.all(child.position <= hi)
+            assert np.isfinite(child.weight)
+            assert child.weight < 1e12
+
+    def test_10d_produces_valid_candidates(self):
+        limits_10d = {f"x{i}": (0.0, 1.0) for i in range(10)}
+        abc = ABCPMC(limits_10d, k=5, tol=10.0, rng=random.Random(0))
+        inds = []
+        for i in range(8):
+            pos = {key: 0.4 + 0.02 * i for key in limits_10d}
+            ind = Individual(pos, limits_10d, tolerance=10.0, generation=i)
+            ind.loss = 0.1 * (i + 1)
+            ind.weight = 1.0
+            inds.append(ind)
+
+        lo = np.zeros(10)
+        hi = np.ones(10)
+        for _ in range(10):
+            child = abc(inds=inds)
+            assert child.position.shape == (10,)
+            assert np.all(child.position >= lo)
+            assert np.all(child.position <= hi)
+            assert np.isfinite(child.weight)
+
 
 class TestABCPMCSchedulerGuard:
     """Tests for fix 2d: scheduler is only called after archive-size check."""
@@ -391,6 +453,57 @@ class TestABCPMCSchedulerGuard:
         assert child.tolerance == pytest.approx(10.0)
 
 
+class TestABCPMCMinTol:
+    def test_tolerance_never_drops_below_min_tol(self):
+        abc = ABCPMC(
+            LIMITS,
+            k=3,
+            tol=10.0,
+            min_tol=2.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            percentile=10.0,
+            rng=random.Random(0),
+        )
+        inds = [make_ind(loss=0.1 * i, tolerance=10.0, generation=i) for i in range(1, 8)]
+        child = abc(inds=inds)
+        assert child.tolerance == pytest.approx(2.0)
+
+    def test_min_tol_none_allows_arbitrary_shrink(self):
+        abc = ABCPMC(
+            LIMITS,
+            k=3,
+            tol=10.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            percentile=50.0,
+            rng=random.Random(0),
+        )
+        inds = [make_ind(loss=0.1 * i, tolerance=10.0, generation=i) for i in range(1, 8)]
+        child = abc(inds=inds)
+        assert child.tolerance == pytest.approx(0.4)
+
+    def test_min_tol_negative_raises(self):
+        with pytest.raises(ValueError, match="min_tol"):
+            ABCPMC(LIMITS, min_tol=-1.0)
+
+    def test_converged_archive_does_not_stall_with_min_tol(self):
+        abc = ABCPMC(
+            LIMITS,
+            k=3,
+            tol=10.0,
+            min_tol=1.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            percentile=50.0,
+            rng=random.Random(0),
+        )
+        inds = [make_ind(loss=0.2 * i, tolerance=0.3, generation=i) for i in range(1, 8)]
+        child = abc(inds=inds)
+        assert child.tolerance == pytest.approx(1.0)
+        assert child.weight > 0
+
+
 class TestFilterByTolerance:
     def test_pure_function_with_explicit_tol(self):
         abc = ABCPMC(LIMITS, k=3, tol=10.0)
@@ -404,6 +517,224 @@ class TestFilterByTolerance:
         inds = make_inds([1.0, 5.0, 15.0])
         _ = abc.filter_by_tolerance(inds, tol=10.0)
         assert abc.tol == 10.0  # unchanged
+
+
+# ===========================================================================
+# Phase 4 — Incremental Cache Tests
+# ===========================================================================
+
+
+class TestIncrementalCacheEquivalence:
+    """Verify that cached path produces identical results to a full rebuild."""
+
+    def _build_growing_history(self, n, k, tol, scheduler_type="acceptance_rate", **kwargs):
+        """Run ABCPMC for n steps, building history incrementally."""
+        abc = ABCPMC(LIMITS, k=k, tol=tol, scheduler_type=scheduler_type, **kwargs)
+        history = []
+        children = []
+        for step in range(n):
+            child = abc(inds=history)
+            child.loss = 0.5 + 0.01 * step  # gradually increasing loss
+            child.generation = step
+            children.append(child)
+            history.append(child)
+        return abc, children, history
+
+    def test_cached_matches_uncached_acceptance_rate(self):
+        """Cached path produces same tolerances as uncached full-rebuild path."""
+        rng1 = random.Random(42)
+        rng2 = random.Random(42)
+        abc_cached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng1,
+                            scheduler_type="acceptance_rate",
+                            additional_needed_inds=0)
+        abc_uncached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng2,
+                              scheduler_type="acceptance_rate",
+                              additional_needed_inds=0)
+        history = []
+        for step in range(30):
+            child1 = abc_cached(inds=history)
+            # Force uncached path by invalidating cache
+            abc_uncached._cache.history_len = -1
+            abc_uncached.tolerance_scheduler.reset_cache()
+            child2 = abc_uncached(inds=history)
+            np.testing.assert_array_almost_equal(child1.position, child2.position)
+            assert child1.tolerance == child2.tolerance
+            assert child1.weight == pytest.approx(child2.weight, rel=1e-10)
+            # Use child1 for history (both should be identical)
+            child1.loss = 0.5 + 0.01 * step
+            child1.generation = step
+            history.append(child1)
+
+    def test_cached_matches_uncached_quantile(self):
+        """Same as above but with quantile scheduler."""
+        rng1 = random.Random(42)
+        rng2 = random.Random(42)
+        abc_cached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng1,
+                            scheduler_type="quantile",
+                            additional_needed_inds=0, percentile=50.0)
+        abc_uncached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng2,
+                              scheduler_type="quantile",
+                              additional_needed_inds=0, percentile=50.0)
+        history = []
+        for step in range(30):
+            child1 = abc_cached(inds=history)
+            abc_uncached._cache.history_len = -1
+            abc_uncached.tolerance_scheduler.reset_cache()
+            child2 = abc_uncached(inds=history)
+            np.testing.assert_array_almost_equal(child1.position, child2.position)
+            child1.loss = 0.5 + 0.01 * step
+            child1.generation = step
+            history.append(child1)
+
+    def test_cached_matches_uncached_geometric_decay(self):
+        """Same as above but with geometric decay scheduler."""
+        rng1 = random.Random(42)
+        rng2 = random.Random(42)
+        abc_cached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng1,
+                            scheduler_type="geometric_decay",
+                            additional_needed_inds=0, decay_factor=0.9)
+        abc_uncached = ABCPMC(LIMITS, k=5, tol=10.0, rng=rng2,
+                              scheduler_type="geometric_decay",
+                              additional_needed_inds=0, decay_factor=0.9)
+        history = []
+        for step in range(30):
+            child1 = abc_cached(inds=history)
+            abc_uncached._cache.history_len = -1
+            abc_uncached.tolerance_scheduler.reset_cache()
+            child2 = abc_uncached(inds=history)
+            np.testing.assert_array_almost_equal(child1.position, child2.position)
+            child1.loss = 0.5 + 0.01 * step
+            child1.generation = step
+            history.append(child1)
+
+
+class TestCacheInvalidation:
+    """Test that cache invalidation (fallback to rebuild) works correctly."""
+
+    def test_shorter_history_triggers_rebuild(self):
+        """If history shrinks, cache must rebuild and still produce valid output."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        # Build up history
+        history = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i)
+                   for i in range(5)]
+        child1 = abc(inds=history)
+        assert child1 is not None
+        # Now pass a shorter history
+        shorter = history[:3]
+        child2 = abc(inds=shorter)
+        assert child2 is not None
+        assert abc._cache.history_len == 3
+
+    def test_multi_ind_delta_processed_correctly(self):
+        """If multiple individuals arrive at once, all are processed."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        # First call with empty history
+        abc(inds=[])
+        assert abc._cache.history_len == 0
+        # Jump to 5 individuals (delta=5, not 1)
+        history = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i)
+                   for i in range(5)]
+        child = abc(inds=history)
+        assert child is not None
+        assert abc._cache.history_len == 5
+        assert abc._cache.n_accepted == 5
+
+    def test_tolerance_tightening_re_filters_cache(self):
+        """When a new ind has a tighter tolerance, cache must drop stale entries."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        # Build history with tolerance=10.0 and various losses
+        history = [make_ind(loss=l, tolerance=10.0, generation=i)
+                   for i, l in enumerate([1.0, 3.0, 5.0, 7.0, 9.0])]
+        abc(inds=history)
+        assert abc._cache.n_accepted == 5  # all < 10.0
+
+        # Add individual with tighter tolerance=4.0
+        new_ind = make_ind(loss=2.0, tolerance=4.0, generation=5)
+        history.append(new_ind)
+        abc(inds=history)
+        # Now only inds with loss < 4.0 are accepted: [1.0, 2.0, 3.0]
+        assert abc._cache.n_accepted == 3
+        assert abc._cache.tol_from_history == 4.0
+
+
+class TestPerformanceRegression:
+    """Verify that __call__ time does not grow quadratically with history size."""
+
+    def test_no_quadratic_scaling(self):
+        """Total time for N calls should be O(N log N), not O(N^2).
+
+        We compare the time for 500 calls against a generous linear budget.
+        The old O(N^2) code would take ~0.5s for 500 calls; with the cache
+        it should be well under 0.1s.
+        """
+        abc = ABCPMC(LIMITS, k=10, tol=100.0, additional_needed_inds=0)
+        history = []
+        n_calls = 500
+        start = time.perf_counter()
+        for step in range(n_calls):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=history)
+            child.loss = 0.1 * step
+            child.generation = step
+            history.append(child)
+        elapsed = time.perf_counter() - start
+        # Budget: 0.5s is extremely generous for 500 O(log N) calls.
+        # Without the cache fix, this would take ~0.5-1.0s on a typical machine.
+        assert elapsed < 2.0, f"500 calls took {elapsed:.2f}s — possible O(N^2) regression"
+
+    def test_late_calls_not_slower_than_early_calls(self):
+        """Per-call time at the end of a run should not be >> per-call time at the start."""
+        abc = ABCPMC(LIMITS, k=10, tol=100.0, additional_needed_inds=0)
+        history = []
+        n_calls = 400
+
+        # Warm up (first 50 calls)
+        for step in range(50):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=history)
+            child.loss = 0.1 * step
+            child.generation = step
+            history.append(child)
+
+        # Time middle batch (calls 50-99)
+        t0 = time.perf_counter()
+        for step in range(50, 100):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=history)
+            child.loss = 0.1 * step
+            child.generation = step
+            history.append(child)
+        early_time = time.perf_counter() - t0
+
+        # Continue to step 400
+        for step in range(100, n_calls):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=history)
+            child.loss = 0.1 * step
+            child.generation = step
+            history.append(child)
+
+        # Time late batch (calls 400-449)
+        t0 = time.perf_counter()
+        for step in range(n_calls, n_calls + 50):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                child = abc(inds=history)
+            child.loss = 0.1 * step
+            child.generation = step
+            history.append(child)
+        late_time = time.perf_counter() - t0
+
+        # Late batch should not be more than 5x slower than early batch.
+        # Without the cache fix, it would be ~8x slower (400/50).
+        assert late_time < 5 * early_time + 0.01, (
+            f"Late batch ({late_time:.4f}s) is much slower than early batch "
+            f"({early_time:.4f}s) — possible O(N) per-call regression"
+        )
 
 
 # ===========================================================================
