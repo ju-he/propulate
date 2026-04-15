@@ -379,21 +379,24 @@ class ABCPMC(Propagator):
         cov += 1e-6 * np.eye(positions.shape[1])
         kernel_cov = self.perturbation_scale * cov
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
-        eigs = np.linalg.eigvalsh(kernel_cov)
-        if eigs.min() <= 0:
-            kernel_cov += (-eigs.min() + 1e-8) * np.eye(positions.shape[1])
+        # Use Cholesky to verify positive-definiteness (faster than eigvalsh)
+        # and retain the factor L for reuse in sampling and PDF evaluation.
+        try:
+            L = np.linalg.cholesky(kernel_cov)
+        except np.linalg.LinAlgError:
+            kernel_cov += 1e-7 * np.eye(positions.shape[1])
+            L = np.linalg.cholesky(kernel_cov)
 
-        # 6. Sample candidate
+        # 6. Sample candidate — reuse L to avoid repeated Cholesky in the loop
         idx = self.rng.choices(range(len(archive)), weights=weights.tolist())[0]
         parent = archive[idx]
 
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
         candidate_pos = parent.position
+        d = positions.shape[1]
         for _attempt in range(self._MAX_RESAMPLE_ATTEMPTS):
-            candidate_pos = parent.position + self.rng_np.multivariate_normal(
-                mean=np.zeros(positions.shape[1]), cov=kernel_cov
-            )
+            candidate_pos = parent.position + L @ self.rng_np.standard_normal(d)
             if np.all(candidate_pos >= lo) and np.all(candidate_pos <= hi):
                 break
         else:
@@ -407,19 +410,21 @@ class ABCPMC(Propagator):
         child.tolerance = effective_tol  # stamped for future history reconstruction
 
         # 7. Compute importance weight w* = pi(theta*) / q_n(theta*)
-        pdfs = []
-        for wp in archive:
-            try:
-                p = multivariate_normal.pdf(
-                    child.position, mean=wp.position, cov=kernel_cov
-                )
-            except np.linalg.LinAlgError:
-                p = multivariate_normal.pdf(
-                    child.position,
-                    mean=wp.position,
-                    cov=kernel_cov + 1e-6 * np.eye(positions.shape[1]),
-                )
-            pdfs.append(p)
+        # Vectorized: evaluate all k PDFs in one call (single Cholesky decomposition).
+        # N(x; μᵢ, Σ) = N(x − μᵢ; 0, Σ), so shift the evaluation point by each mean.
+        diffs = child.position - positions  # shape (k, d)
+        try:
+            pdfs = np.broadcast_to(
+                np.atleast_1d(multivariate_normal.pdf(diffs, mean=np.zeros(d), cov=kernel_cov)),  # type: ignore[arg-type]
+                (len(archive),),
+            )
+        except np.linalg.LinAlgError:
+            pdfs = np.broadcast_to(
+                np.atleast_1d(
+                    multivariate_normal.pdf(diffs, mean=np.zeros(d), cov=kernel_cov + 1e-6 * np.eye(d))  # type: ignore[arg-type]
+                ),
+                (len(archive),),
+            )
 
         denom = float(np.dot(weights, pdfs))
         if denom < 1e-12:
