@@ -100,7 +100,8 @@ class TestQuantileScheduler:
         inds = make_inds([1.0, 2.0, 3.0])  # 3 < 4, not enough
         assert sched.compute(inds, 10.0) == 10.0
         inds4 = make_inds([1.0, 2.0, 3.0, 4.0])  # 4 == 4, triggers
-        assert sched.compute(inds4, 10.0) == pytest.approx(2.5)
+        # Lower-rank 50th percentile: index = int(0.5 * 4) = 2 → losses_sorted[2] = 3.0.
+        assert sched.compute(inds4, 10.0) == pytest.approx(3.0)
 
 
 class TestGeometricDecayScheduler:

@@ -520,6 +520,11 @@ class QuantileScheduler(EpsilonScheduler):
     Unlike the prior stateful implementation, ``compute`` operates only on
     individuals already accepted at ``current_tol``, avoiding the all-history
     bias that arises when prior-phase samples (with large losses) are included.
+
+    Uses lower-rank percentile (``losses_sorted[int(p/100 * n)]``) — no
+    interpolation between adjacent ranks. This makes ``compute_cached`` an
+    ``O(1)`` indexed access on the already-sorted history view, and keeps the
+    cached and uncached paths in exact agreement.
     """
 
     def __init__(
@@ -536,16 +541,18 @@ class QuantileScheduler(EpsilonScheduler):
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         accepted = [ind for ind in inds if ind.loss < current_tol]
-        if len(accepted) < self.population_size + self.additional_needed_inds:
+        n = len(accepted)
+        if n < self.population_size + self.additional_needed_inds:
             return current_tol
-        losses = [ind.loss for ind in accepted]
-        return float(np.percentile(losses, self.percentile))
+        losses_sorted = sorted(ind.loss for ind in accepted)
+        return float(losses_sorted[int(self.percentile / 100.0 * n)])
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
         n = accepted_by_loss.bisect_key_left(current_tol)
         if n < self.population_size + self.additional_needed_inds:
             return current_tol
-        return float(np.percentile([ind.loss for ind in accepted_by_loss[:n]], self.percentile))
+        idx = int(self.percentile / 100.0 * n)
+        return float(accepted_by_loss[idx].loss)
 
 
 class GeometricDecayScheduler(EpsilonScheduler):
