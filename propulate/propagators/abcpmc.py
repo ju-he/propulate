@@ -388,7 +388,7 @@ class ABCPMC(Propagator):
             L = np.linalg.cholesky(kernel_cov)
 
         # 6. Sample candidate — reuse L to avoid repeated Cholesky in the loop
-        idx = self.rng.choices(range(len(archive)), weights=weights.tolist())[0]
+        idx = int(self.rng_np.choice(len(archive), p=weights))
         parent = archive[idx]
 
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
