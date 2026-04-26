@@ -290,7 +290,8 @@ class ABCPMC(Propagator):
             return np.zeros((values.shape[1], values.shape[1]))
         factor = w / denom
         diffs = values - mean
-        cov = np.einsum("i,ij,ik->jk", weights, diffs, diffs)
+        wd = weights[:, None] * diffs
+        cov = wd.T @ diffs
         return factor * cov
 
     def __call__(self, inds: List[Individual]) -> Individual:
@@ -357,22 +358,20 @@ class ABCPMC(Propagator):
         archive = self._cache.get_archive(effective_tol, self.k)
 
         # 5. Build perturbation kernel from archive
-        _raw_weights = []
-        _warned_none = False
-        for ind in archive:
-            if ind.weight is None:
-                if not _warned_none:
-                    logger.warning(
-                        "ABCPMC: one or more archive individuals have weight=None "
-                        "(likely from an external propagator). Falling back to weight=1.0 "
-                        "for those individuals; importance weights will be approximate."
-                    )
-                    _warned_none = True
-                _raw_weights.append(1.0)
-            else:
-                _raw_weights.append(ind.weight)
-        weights = np.array(_raw_weights, dtype=float)
-        weights /= weights.sum()
+        if any(ind.weight is None for ind in archive):
+            if not getattr(self, "_warned_none", False):
+                logger.warning(
+                    "ABCPMC: one or more archive individuals have weight=None "
+                    "(likely from an external propagator). Falling back to weight=1.0 "
+                    "for those individuals; importance weights will be approximate."
+                )
+                self._warned_none = True
+        raw = np.fromiter(
+            (1.0 if ind.weight is None else ind.weight for ind in archive),
+            dtype=float,
+            count=len(archive),
+        )
+        weights = raw / raw.sum()
 
         positions = np.stack([ind.position for ind in archive])
         cov = self.weighted_covariance(positions, weights)
