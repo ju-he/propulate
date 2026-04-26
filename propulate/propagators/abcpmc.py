@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Union
 
 import numpy as np
-from scipy.stats import multivariate_normal
+from scipy.linalg import solve_triangular
 from sortedcontainers import SortedKeyList
 
 from ..population import Individual
@@ -379,8 +379,8 @@ class ABCPMC(Propagator):
         cov += 1e-6 * np.eye(positions.shape[1])
         kernel_cov = self.perturbation_scale * cov
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
-        # Use Cholesky to verify positive-definiteness (faster than eigvalsh)
-        # and retain the factor L for reuse in sampling and PDF evaluation.
+        # Cholesky-factorise once; L is reused for both sampling and the
+        # log-PDF evaluation below.
         try:
             L = np.linalg.cholesky(kernel_cov)
         except np.linalg.LinAlgError:
@@ -410,21 +410,14 @@ class ABCPMC(Propagator):
         child.tolerance = effective_tol  # stamped for future history reconstruction
 
         # 7. Compute importance weight w* = pi(theta*) / q_n(theta*)
-        # Vectorized: evaluate all k PDFs in one call (single Cholesky decomposition).
-        # N(x; μᵢ, Σ) = N(x − μᵢ; 0, Σ), so shift the evaluation point by each mean.
-        diffs = child.position - positions  # shape (k, d)
-        try:
-            pdfs = np.broadcast_to(
-                np.atleast_1d(multivariate_normal.pdf(diffs, mean=np.zeros(d), cov=kernel_cov)),  # type: ignore[arg-type]
-                (len(archive),),
-            )
-        except np.linalg.LinAlgError:
-            pdfs = np.broadcast_to(
-                np.atleast_1d(
-                    multivariate_normal.pdf(diffs, mean=np.zeros(d), cov=kernel_cov + 1e-6 * np.eye(d))  # type: ignore[arg-type]
-                ),
-                (len(archive),),
-            )
+        # Manual multivariate-normal log-PDF using the existing Cholesky factor
+        # L: a single triangular solve gives all k Mahalanobis distances and
+        # avoids re-factorising the covariance inside scipy.
+        diffs = child.position - positions                      # (k, d)
+        z = solve_triangular(L, diffs.T, lower=True)            # (d, k)
+        log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
+        log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z, z)  # (k,)
+        pdfs = np.exp(log_pdfs)
 
         denom = float(np.dot(weights, pdfs))
         if denom < 1e-12:

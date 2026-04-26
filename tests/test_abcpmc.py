@@ -369,10 +369,15 @@ class TestABCPMCEdgeCases:
         abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
 
-        def tiny_pdf(*args, **kwargs):
-            return 1e-20
+        def force_underflow(*args, **kwargs):
+            # Return huge Mahalanobis residuals so the log-PDF underflows to 0,
+            # forcing the near-zero denominator branch.
+            b = args[1]
+            return np.full_like(b, 1e8, dtype=float)
 
-        monkeypatch.setattr("propulate.propagators.abcpmc.multivariate_normal.pdf", tiny_pdf)
+        monkeypatch.setattr(
+            "propulate.propagators.abcpmc.solve_triangular", force_underflow
+        )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", RuntimeWarning)
             child = abc(inds=inds)
