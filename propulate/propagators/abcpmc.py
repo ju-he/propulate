@@ -393,13 +393,23 @@ class ABCPMC(Propagator):
 
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
-        candidate_pos = parent.position
         d = positions.shape[1]
-        for _attempt in range(self._MAX_RESAMPLE_ATTEMPTS):
-            candidate_pos = parent.position + L @ self.rng_np.standard_normal(d)
-            if np.all(candidate_pos >= lo) and np.all(candidate_pos <= hi):
+        # Batched reject-resample: draw BATCH candidates per iteration so the
+        # numpy/BLAS overhead is amortised across many candidates. Pathological
+        # high-rejection regimes get ~BATCH× speedup; the common 1-2 attempt
+        # case pays only the cost of one BATCH-sized draw (still cheap).
+        BATCH = 16
+        candidate_pos = parent.position
+        found = False
+        for _ in range(self._MAX_RESAMPLE_ATTEMPTS // BATCH):
+            z = self.rng_np.standard_normal((BATCH, d))
+            cands = parent.position + z @ L.T
+            in_box = np.all((cands >= lo) & (cands <= hi), axis=1)
+            if in_box.any():
+                candidate_pos = cands[int(np.argmax(in_box))]
+                found = True
                 break
-        else:
+        if not found:
             candidate_pos = np.clip(candidate_pos, lo, hi)
             logger.debug(
                 "ABCPMC: reject-resample exhausted %d attempts; falling back to boundary clipping.",
