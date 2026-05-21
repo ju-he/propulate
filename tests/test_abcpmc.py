@@ -382,7 +382,7 @@ class TestABCPMCEdgeCases:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", RuntimeWarning)
             child = abc(inds=inds)
-        assert any("importance weight denominator is zero" in str(w.message) for w in caught)
+        assert any("importance weight denominator" in str(w.message) for w in caught)
         assert np.isfinite(child.weight)
         assert child.weight == pytest.approx(1e12)
 
@@ -741,6 +741,249 @@ class TestPerformanceRegression:
             f"Late batch ({late_time:.4f}s) is much slower than early batch "
             f"({early_time:.4f}s) — possible O(N) per-call regression"
         )
+
+
+# ===========================================================================
+# Phase 6 — Smooth-kernel and AMIS reweighting tests
+# ===========================================================================
+
+
+from propulate.propagators.abcpmc import (
+    _EpanechnikovKernel,
+    _GaussianKernel,
+    _HardKernel,
+    _make_kernel,
+)
+
+
+class TestKernels:
+    """Direct tests of the K_eps(rho) kernel implementations."""
+
+    def test_hard_kernel_indicator(self):
+        k = _HardKernel()
+        rho = np.array([0.0, 0.5, 1.0, 1.5])
+        w = k.weight(rho, 1.0)
+        assert np.allclose(w, [1.0, 1.0, 0.0, 0.0])
+
+    def test_gaussian_kernel_values(self):
+        k = _GaussianKernel()
+        rho = np.array([0.0, 1.0])
+        w = k.weight(rho, 1.0)
+        # exp(0) = 1, exp(-1/2) ~ 0.6065
+        assert np.isclose(w[0], 1.0)
+        assert np.isclose(w[1], np.exp(-0.5))
+
+    def test_gaussian_kernel_never_zero_except_eps_zero(self):
+        k = _GaussianKernel()
+        rho = np.array([100.0])
+        # Very large rho but eps > 0: kernel is exponentially small but >= 0.
+        w = k.weight(rho, 1.0)
+        assert np.all(w >= 0.0)
+
+    def test_epanechnikov_compact_support(self):
+        k = _EpanechnikovKernel()
+        rho = np.array([0.0, 0.5, 1.0, 1.5])
+        w = k.weight(rho, 1.0)
+        # 1 - rho^2/eps^2 for rho < eps, else 0.
+        assert np.isclose(w[0], 1.0)
+        assert np.isclose(w[1], 0.75)
+        assert np.isclose(w[2], 0.0)
+        assert np.isclose(w[3], 0.0)
+
+    def test_log_weight_consistent_with_weight(self):
+        for name in ("hard", "gaussian", "epanechnikov"):
+            k = _make_kernel(name)
+            rho = np.array([0.1, 0.5, 0.9, 1.2])
+            w = k.weight(rho, 1.0)
+            lw = k.log_weight(rho, 1.0)
+            # For nonzero w, exp(log_weight) == weight.
+            nz = w > 0.0
+            assert np.allclose(np.exp(lw[nz]), w[nz])
+            # Zero w corresponds to -inf log weight.
+            assert np.all(np.isneginf(lw[~nz])) if (~nz).any() else True
+
+    def test_support_radius(self):
+        assert _HardKernel().support_radius(2.0) == 2.0
+        assert _EpanechnikovKernel().support_radius(2.0) == 2.0
+        # Gaussian: 8 sigma, well beyond 1e-12 cutoff.
+        assert _GaussianKernel().support_radius(2.0) > 2.0
+
+    def test_make_kernel_unknown_raises(self):
+        with pytest.raises(ValueError, match="Unknown ABCPMC kernel"):
+            _make_kernel("triangular")
+
+
+class TestABCPMCKernelModes:
+    """ABCPMC end-to-end behaviour under each kernel mode."""
+
+    @pytest.mark.parametrize("kernel", ["hard", "gaussian", "epanechnikov"])
+    def test_run_produces_finite_weights(self, kernel):
+        limits = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+        rng = random.Random(7)
+        abc = ABCPMC(
+            limits=limits,
+            k=10,
+            tol=1.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel=kernel,
+            rng=rng,
+        )
+        inds = []
+        rng_np = np.random.default_rng(123)
+        for i in range(60):
+            child = abc(inds)
+            child.loss = float(rng_np.uniform(0.0, 2.0))
+            child.generation = i
+            inds.append(child)
+        # After bootstrap we should be in archive phase: every child has a
+        # finite, positive weight and (for archive-phase) a stamped tolerance.
+        for child in inds[-5:]:
+            assert np.isfinite(child.weight)
+            assert child.weight > 0.0
+
+    def test_smooth_kernel_bootstrap_rule(self):
+        """Smooth kernels exit prior phase once history >= k, regardless of loss."""
+        abc = ABCPMC(
+            limits=LIMITS,
+            k=5,
+            tol=0.01,                       # very tight initial bandwidth
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            kernel="gaussian",
+            rng=random.Random(11),
+        )
+        # Feed 4 individuals with large losses (would be rejected under hard kernel).
+        inds = make_inds([10.0, 10.0, 10.0, 10.0])
+        # With smooth kernel we still need 5 to exit prior phase.
+        child = abc(inds)
+        assert child.tolerance is None  # prior-phase child has no stamped tolerance
+        # Adding a 5th flips us into archive phase.
+        inds.append(make_ind(10.0, generation=4))
+        child2 = abc(inds)
+        assert child2.tolerance is not None
+        assert np.isfinite(child2.weight)
+
+    def test_hard_kernel_preserves_classical_prior_phase(self):
+        """Hard kernel keeps the count_below(eps) >= k rule."""
+        abc = ABCPMC(
+            limits=LIMITS,
+            k=5,
+            tol=1.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            kernel="hard",
+            rng=random.Random(13),
+        )
+        # 10 inds all above tol => still prior phase (under hard kernel).
+        inds = make_inds([5.0] * 10, tolerance=None)
+        child = abc(inds)
+        # Hard prior-phase child: weight=1.0, no stamped tolerance.
+        assert child.weight == 1.0
+        assert child.tolerance is None
+
+    def test_epanechnikov_all_outside_support_fallback(self):
+        """When every archive particle has K_eps == 0 the algorithm falls back to uniform weights."""
+        # Tight bandwidth + archive populated with high-loss particles =>
+        # all kernel weights zero. Algorithm should still produce a finite weight.
+        abc = ABCPMC(
+            limits=LIMITS,
+            k=3,
+            tol=0.01,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            kernel="epanechnikov",
+            rng=random.Random(17),
+        )
+        inds = [make_ind(5.0, tolerance=0.01, generation=i) for i in range(6)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            child = abc(inds)
+        assert np.isfinite(child.weight)
+
+
+class TestAMISBuffer:
+    """Streaming AMIS snapshot buffer behaviour."""
+
+    def test_disabled_by_default(self):
+        abc = ABCPMC(limits=LIMITS, k=5, tol=1.0, scheduler_type="quantile", additional_needed_inds=0)
+        assert abc._amis_snapshots == 0
+
+    def test_buffer_populates_at_interval(self):
+        limits = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+        abc = ABCPMC(
+            limits=limits,
+            k=5,
+            tol=1.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            kernel="gaussian",
+            amis_snapshots=4,
+            amis_interval=3,
+            rng=random.Random(19),
+        )
+        inds = []
+        rng_np = np.random.default_rng(31)
+        for i in range(40):
+            child = abc(inds)
+            child.loss = float(rng_np.uniform(0.0, 2.0))
+            child.generation = i
+            inds.append(child)
+        # We've made many archive-phase calls; buffer should be at its max
+        # configured size (newer snapshots evict the oldest).
+        assert len(abc._snapshots) == 4
+
+    def test_amis_denominator_differs_from_naive(self):
+        """With a non-empty snapshot buffer, the denom uses past proposals too."""
+        abc_naive = ABCPMC(
+            limits=LIMITS, k=5, tol=1.0, scheduler_type="quantile",
+            additional_needed_inds=0, kernel="gaussian",
+            amis_snapshots=0, rng=random.Random(23),
+        )
+        abc_amis = ABCPMC(
+            limits=LIMITS, k=5, tol=1.0, scheduler_type="quantile",
+            additional_needed_inds=0, kernel="gaussian",
+            amis_snapshots=4, amis_interval=2, rng=random.Random(23),
+        )
+        # Same evaluated history (controlled losses), same seeds — the weight
+        # streams diverge once the AMIS buffer kicks in.
+        inds_naive, inds_amis = [], []
+        rng_np = np.random.default_rng(29)
+        common_losses = list(rng_np.uniform(0.0, 2.0, size=40))
+        for i, loss in enumerate(common_losses):
+            c1 = abc_naive(inds_naive)
+            c1.loss = loss
+            c1.generation = i
+            inds_naive.append(c1)
+            c2 = abc_amis(inds_amis)
+            c2.loss = loss
+            c2.generation = i
+            inds_amis.append(c2)
+        # By construction the AMIS denom averages over multiple snapshots,
+        # so at least one archive-phase weight should differ.
+        archive_phase_naive = [i.weight for i in inds_naive if i.tolerance is not None]
+        archive_phase_amis = [i.weight for i in inds_amis if i.tolerance is not None]
+        assert len(archive_phase_amis) == len(archive_phase_naive)
+        assert not np.allclose(archive_phase_naive, archive_phase_amis)
+
+
+class TestSchedulerKernelAwareFlag:
+    """Schedulers accept the kernel_aware flag without changing behaviour (for now)."""
+
+    def test_quantile_accepts_kernel_aware(self):
+        sched = QuantileScheduler(10.0, 5, 0, percentile=50.0, kernel_aware=True)
+        assert sched.kernel_aware is True
+        # Behaviour identical to kernel_aware=False at present.
+        inds = make_inds([0.1, 0.2, 0.3, 0.4, 0.5])
+        eps = sched.compute(inds, 10.0)
+        assert isinstance(eps, float)
+
+    def test_factory_passes_kernel_aware(self):
+        sched = create_scheduler(
+            "geometric_decay", 10.0, 5, 0, kernel_aware=True, decay_factor=0.9
+        )
+        assert sched.kernel_aware is True
 
 
 # ===========================================================================

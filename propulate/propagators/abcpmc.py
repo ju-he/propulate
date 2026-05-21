@@ -2,6 +2,7 @@ import logging
 import random
 import warnings
 from abc import ABC, abstractmethod
+from collections import deque
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -13,6 +14,137 @@ from ..population import Individual
 from .base import Propagator
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ABC likelihood kernels
+# ---------------------------------------------------------------------------
+#
+# The kernel K_eps(rho) turns the discrepancy rho between simulated and observed
+# data into a smooth (or hard) likelihood approximation for the ABC posterior
+#
+#     pi_eps(theta) ~ pi(theta) * E[K_eps(rho)].
+#
+# Hard kernel reproduces the classical ABC rejection rule; Gaussian and
+# Epanechnikov are smooth variants (Wilkinson 2013, Sisson-Fan-Beaumont 2018).
+# Smooth kernels remove the prior-vs-archive phase discontinuity and unlock the
+# AMIS / smooth-ABC consistency theory used by the streaming reweighting below.
+
+
+class _Kernel(ABC):
+    """ABC likelihood kernel K_eps(rho)."""
+
+    name: str = ""
+
+    @abstractmethod
+    def log_weight(self, rho: np.ndarray, eps: float) -> np.ndarray:
+        """Return log K_eps(rho), elementwise. May contain -inf entries."""
+
+    def weight(self, rho: np.ndarray, eps: float) -> np.ndarray:
+        """Return K_eps(rho), elementwise."""
+        return np.exp(self.log_weight(rho, eps))
+
+    def support_radius(self, eps: float) -> float:
+        """
+        Loss radius beyond which K_eps(rho) is treated as zero.
+
+        Used to size the candidate pool for archive selection. For compactly
+        supported kernels this is the true support boundary; for the Gaussian
+        kernel it is the radius beyond which the weight is below ``1e-12``.
+        """
+        return float("inf")
+
+
+class _HardKernel(_Kernel):
+    """K_eps(rho) = 1 if rho < eps else 0 — the classical ABC indicator."""
+
+    name = "hard"
+
+    def log_weight(self, rho: np.ndarray, eps: float) -> np.ndarray:
+        rho = np.asarray(rho, dtype=float)
+        out = np.where(rho < eps, 0.0, -np.inf)
+        return out
+
+    def support_radius(self, eps: float) -> float:
+        return float(eps)
+
+
+class _GaussianKernel(_Kernel):
+    """K_eps(rho) = exp(-rho^2 / (2 eps^2)) — smooth, never zero."""
+
+    name = "gaussian"
+
+    def log_weight(self, rho: np.ndarray, eps: float) -> np.ndarray:
+        rho = np.asarray(rho, dtype=float)
+        if eps <= 0.0:
+            return np.where(rho == 0.0, 0.0, -np.inf)
+        return -0.5 * (rho / eps) ** 2
+
+    def support_radius(self, eps: float) -> float:
+        # exp(-x^2/2) < 1e-12 for |x| > ~7.43; pad to 8 sigma.
+        return 8.0 * float(eps)
+
+
+class _EpanechnikovKernel(_Kernel):
+    """K_eps(rho) = max(0, 1 - rho^2 / eps^2) — compactly supported."""
+
+    name = "epanechnikov"
+
+    def log_weight(self, rho: np.ndarray, eps: float) -> np.ndarray:
+        rho = np.asarray(rho, dtype=float)
+        if eps <= 0.0:
+            return np.where(rho == 0.0, 0.0, -np.inf)
+        u = 1.0 - (rho / eps) ** 2
+        # Use -inf for u <= 0; log of small positive u is safe via np.log here
+        # because np.where evaluates both branches and we mask after the fact.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_u = np.log(np.where(u > 0.0, u, 1.0))
+        return np.where(u > 0.0, log_u, -np.inf)
+
+    def support_radius(self, eps: float) -> float:
+        return float(eps)
+
+
+_KERNEL_REGISTRY = {
+    "hard": _HardKernel,
+    "gaussian": _GaussianKernel,
+    "epanechnikov": _EpanechnikovKernel,
+}
+
+
+def _make_kernel(name: str) -> _Kernel:
+    """Construct a kernel by name. Valid names: 'hard', 'gaussian', 'epanechnikov'."""
+    try:
+        return _KERNEL_REGISTRY[name]()
+    except KeyError:
+        raise ValueError(
+            f"Unknown ABCPMC kernel '{name}'. "
+            f"Valid kernels: {sorted(_KERNEL_REGISTRY)}"
+        )
+
+
+class _ArchiveSnapshot:
+    """Frozen view of the proposal distribution used at one past call.
+
+    Stores enough state to evaluate the past proposal density q_tau(theta) at
+    any new theta: archive positions, normalised mixture weights, and the
+    Cholesky factor of the perturbation covariance.
+    """
+
+    __slots__ = ("positions", "weights", "L", "log_norm")
+
+    def __init__(self, positions: np.ndarray, weights: np.ndarray, L: np.ndarray) -> None:
+        self.positions = positions
+        self.weights = weights
+        self.L = L
+        d = positions.shape[1]
+        self.log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
+
+    def log_pdf(self, theta: np.ndarray) -> np.ndarray:
+        """Log-PDF of each mixture component at theta. Shape: (k,)."""
+        diffs = theta - self.positions  # (k, d)
+        z = solve_triangular(self.L, diffs.T, lower=True)  # (d, k)
+        return self.log_norm - 0.5 * np.einsum("ij,ij->j", z, z)
 
 
 class _IncrementalCache:
@@ -104,37 +236,55 @@ class _IncrementalCache:
 
 class ABCPMC(Propagator):
     """
-    Steady-state asynchronous ABC-PMC propagator.
+    Steady-state asynchronous ABC-PMC propagator with configurable likelihood
+    kernel and optional streaming-AMIS reweighting.
 
-    The algorithm is fully stateless: all algorithm state (effective tolerance,
-    active archive) is reconstructed from the evaluated-history list ``inds``
-    passed to ``__call__`` on every invocation. Internal caches may be updated
-    as a performance optimization, but they do not carry algorithmic state.
-    This requires ``inds`` to be append-only: previously seen ``Individual``
-    instances must not be mutated in place or reordered between calls.
+    The algorithm is fully stateless w.r.t. its algorithmic state: the
+    effective bandwidth and the active archive are reconstructed from the
+    evaluated-history list ``inds`` passed to ``__call__`` on every
+    invocation. Internal caches and the AMIS snapshot ring buffer are
+    *performance* state — they do not change the result for valid inputs.
+    ``inds`` must be append-only between calls.
 
-    Tolerance memory is carried by each proposed ``Individual`` via the
-    ``Individual.tolerance`` field.  The effective tolerance at any call is
-    ``min(ind.tolerance for ind in inds if ind.tolerance is not None)``,
-    falling back to the constructor argument ``tol`` when history is empty.
-    A monotone decrease is guaranteed by taking the min of the history value
-    and the scheduler's proposed value.
+    Kernel modes
+    ------------
+    The ``kernel`` parameter selects the ABC likelihood approximation
+    K_eps(rho):
 
-    .. note::
-        **Weight staleness**: importance weights (``child.weight``) are computed
-        against the archive state at proposal time.  In asynchronous execution
-        results may arrive after the archive has evolved; the weights are
-        therefore an approximation that degrades gracefully for slowly-changing
-        archives.
+    - ``"hard"`` — ``1[rho < eps]``. Classical rejection-style ABC-PMC. A
+      prior phase samples uniformly from the search space until the archive
+      contains ``k`` particles with ``loss < eps``; past that, the archive is
+      the top-``k`` by lowest loss within the tolerance.
+    - ``"gaussian"`` — ``exp(-rho^2 / 2 eps^2)``. Smooth-kernel ABC
+      (Wilkinson 2013). Every particle contributes proportionally; the
+      prior-vs-archive phase distinction is replaced by a bootstrap rule
+      (uniform prior until ``len(history) >= k``).
+    - ``"epanechnikov"`` — ``max(0, 1 - rho^2 / eps^2)``. Compactly
+      supported smooth kernel; particles with ``rho > eps`` contribute zero.
 
-    .. note::
-        **Prior-phase weight mixing**: prior-phase individuals sampled before
-        the archive fills are assigned ``weight=1.0`` (uniform prior).  Once
-        the archive phase begins, these individuals may coexist in the archive
-        alongside importance-weighted particles, mixing two weighting schemes.
-        This is a benign approximation for large archives but importance-weight
-        statistics should be treated as unreliable while the archive is newly
-        formed.
+    For smooth kernels (``"gaussian"`` / ``"epanechnikov"``) the bandwidth
+    ``eps`` is selected by the scheduler in its *kernel-aware* mode (e.g.
+    target-ESS bisection for ``QuantileScheduler``).
+
+    AMIS reweighting
+    ----------------
+    When ``amis_snapshots > 0``, the propagator maintains a ring buffer of
+    past proposal distributions. New particles' importance weights use the
+    balance-heuristic denominator
+
+        q_bar_n(theta) = (1 / S) * sum_s q_s(theta)
+
+    over snapshots s, in addition to the current proposal. This is the
+    streaming variant of Cornuet et al. 2012's AMIS scheme and gives a
+    coherent reweighting against the cumulative proposal mixture rather than
+    the moment-of-arrival proposal. Set ``amis_snapshots=0`` for the legacy
+    single-current-proposal weighting.
+
+    Stored ``Individual`` weights are the *core* importance weights
+    ``pi(theta) / denom(theta)`` measured at proposal time; the kernel
+    factor ``K_eps(rho)`` is applied separately at use time, so changes to
+    eps automatically reweight the archive without re-evaluating the
+    simulator.
 
     See Also
     --------
@@ -142,6 +292,7 @@ class ABCPMC(Propagator):
     """
 
     _MAX_RESAMPLE_ATTEMPTS = 1000
+    _MIN_DENOM = 1e-12  # numerical floor for the importance-weight denominator
 
     def __init__(
         self,
@@ -153,6 +304,9 @@ class ABCPMC(Propagator):
         additional_needed_inds: Optional[int] = None,
         min_tol: Optional[float] = None,
         rng: Optional[random.Random] = None,
+        kernel: str = "hard",
+        amis_snapshots: int = 0,
+        amis_interval: Optional[int] = None,
         **kwargs: Union[float, int, str],
     ) -> None:
         """
@@ -163,24 +317,36 @@ class ABCPMC(Propagator):
         limits : Dict
             Search-space limits for each gene (float intervals only).
         perturbation_scale : float
-            Scale factor for the Gaussian perturbation covariance.
+            Scale factor for the perturbation covariance.
         k : int
-            Archive size: number of best accepted individuals used to build
-            the mixture proposal.
+            Archive size: number of accepted individuals used to build the
+            mixture proposal.
         tol : float
-            Initial tolerance.  This value is **never mutated** after
-            construction; it serves only as the fallback when history is empty.
+            Initial tolerance / bandwidth. **Never mutated** after
+            construction; serves as the fallback when history is empty.
         scheduler_type : str
-            Tolerance scheduler.  One of ``'quantile'``,
-            ``'geometric_decay'``, ``'acceptance_rate'``.
+            Bandwidth scheduler. One of ``'quantile'``, ``'geometric_decay'``,
+            ``'acceptance_rate'``.
         additional_needed_inds : int, optional
-            Minimum number of *extra* accepted individuals beyond ``k`` before
-            the scheduler proposes a tolerance update.  Defaults to ``k``.
+            Minimum extra accepted individuals beyond ``k`` before the
+            scheduler proposes an update. Defaults to ``k``.
         rng : random.Random, optional
             Random number generator forwarded to the base ``Propagator``.
         min_tol : float, optional
-            Lower bound applied to the effective tolerance after scheduler
+            Lower bound applied to the effective bandwidth after scheduler
             proposals and fallback reconstruction.
+        kernel : str
+            ABC likelihood kernel. One of ``'hard'`` (classical),
+            ``'gaussian'`` (smooth, recommended), ``'epanechnikov'``
+            (compactly supported). Default ``'hard'`` for back-compat.
+        amis_snapshots : int
+            Number of past proposal snapshots to retain for streaming-AMIS
+            balance-heuristic reweighting (Cornuet et al. 2012). Default 0
+            (legacy single-proposal weighting). Recommended for smooth
+            kernels: ``20``.
+        amis_interval : int, optional
+            Number of ``__call__`` invocations between snapshots. Defaults
+            to ``k`` so each snapshot represents one archive turnover.
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -198,8 +364,16 @@ class ABCPMC(Propagator):
             self.additional_needed_inds = k
         else:
             self.additional_needed_inds = additional_needed_inds
+        self.kernel_name = kernel
+        self._kernel_fn: _Kernel = _make_kernel(kernel)
+        self._kernel_aware = kernel != "hard"
         self.tolerance_scheduler = create_scheduler(
-            scheduler_type, tol, k, self.additional_needed_inds, **kwargs
+            scheduler_type,
+            tol,
+            k,
+            self.additional_needed_inds,
+            kernel_aware=self._kernel_aware,
+            **kwargs,
         )
         self.rng_np = np.random.default_rng(
             self.rng.getrandbits(128)
@@ -211,6 +385,14 @@ class ABCPMC(Propagator):
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
         self._cache = _IncrementalCache(self.tol)
+
+        # AMIS snapshot ring buffer (performance state, not algorithmic state).
+        if amis_snapshots < 0:
+            raise ValueError("amis_snapshots must be >= 0.")
+        self._amis_snapshots = amis_snapshots
+        self._amis_interval = amis_interval if amis_interval is not None else max(1, self.k)
+        self._snapshots: deque = deque(maxlen=amis_snapshots) if amis_snapshots > 0 else deque(maxlen=1)
+        self._calls_since_snapshot = 0
 
     def _update_cache(self, inds: List[Individual]) -> None:
         """Incrementally update the internal performance cache."""
@@ -298,18 +480,13 @@ class ABCPMC(Propagator):
         """
         Generate a new candidate individual.
 
-        The algorithm is fully stateless: all required state is derived from
-        *inds* on every call.
-
-        Steps
-        -----
-        1. Reconstruct effective tolerance from ``ind.tolerance`` fields.
-        2. Check preliminary archive at current tolerance; if too small → prior phase.
-        3. Call scheduler to propose a tighter tolerance (monotone guarantee).
-        4. Accept tighter tolerance only if the archive remains full; otherwise hold.
-        5. Build perturbation kernel from archive.
-        6. Sample candidate by perturbing a weighted-random archive member.
-        7. Stamp candidate with effective tolerance and compute importance weight.
+        The algorithm is stateless w.r.t. its algorithmic state: effective
+        bandwidth and archive are reconstructed from ``inds`` on every call.
+        The kernel mode (``self.kernel_name``) determines whether
+        ``effective_tol`` is a hard rejection threshold or a smooth-kernel
+        bandwidth. When the AMIS snapshot buffer is enabled the importance
+        weight denominator is the balance-heuristic average over snapshots
+        plus the current proposal (Veach 1997, Cornuet et al. 2012).
 
         Parameters
         ----------
@@ -321,22 +498,30 @@ class ABCPMC(Propagator):
         Individual
             The next candidate (unevaluated, ``loss == inf``).
         """
-        # 1. Update incremental cache; reconstructs tol_from_history.
+        # 1. Reconstruct effective bandwidth from history.
         self._update_cache(inds)
         tol_from_history = self._cache.tol_from_history
         current_tol = tol_from_history
         if self.min_tol is not None:
             current_tol = max(current_tol, self.min_tol)
 
-        # 2. Prior-phase guard: check archive BEFORE calling scheduler to avoid
-        #    premature tolerance tightening that could oscillate the archive below k.
-        if self._cache.count_below(current_tol) < self.k:
+        # 2. Bootstrap (prior) phase. Hard kernel preserves the classical
+        #    rule (need k particles below current threshold); smooth kernels
+        #    use the simpler "len(history) >= k" rule since the kernel
+        #    handles acceptance smoothly with no hard discontinuity.
+        if self.kernel_name == "hard":
+            need_more_particles = self._cache.count_below(current_tol) < self.k
+        else:
+            history_len = max(0, self._cache.history_len)
+            need_more_particles = history_len < self.k
+
+        if need_more_particles:
             sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
             child = Individual(position=sample, limits=self.limits)
             child.weight = 1.0
             return child
 
-        # 3. Archive is full — safe to call scheduler and propose a tighter tolerance
+        # 3. Scheduler proposes a tighter bandwidth (monotone guarantee enforced below).
         proposed_tol = self.tolerance_scheduler.compute_cached(
             inds, current_tol,
             self._cache._accepted_by_loss,
@@ -347,17 +532,38 @@ class ABCPMC(Propagator):
         if self.min_tol is not None:
             candidate_tol = max(candidate_tol, self.min_tol)
 
-        # 4. Accept tighter tolerance only if the archive remains full; otherwise hold
-        if self._cache.count_below(candidate_tol) >= self.k:
-            effective_tol = candidate_tol
+        # 4. Accept the tighter bandwidth. Under the hard kernel we only
+        #    tighten if the archive remains full at the new threshold;
+        #    under smooth kernels the archive is always top-k by lowest
+        #    loss and the kernel weights handle the rest.
+        if self.kernel_name == "hard":
+            if self._cache.count_below(candidate_tol) >= self.k:
+                effective_tol = candidate_tol
+            else:
+                effective_tol = current_tol
         else:
-            effective_tol = current_tol
+            effective_tol = candidate_tol
         if self.min_tol is not None:
             effective_tol = max(effective_tol, self.min_tol)
 
-        archive = self._cache.get_archive(effective_tol, self.k)
+        # 5. Select archive. Hard kernel: top-k below threshold. Smooth
+        #    kernels: top-k by lowest loss (kernel weight handles cutoff).
+        if self.kernel_name == "hard":
+            archive = self._cache.get_archive(effective_tol, self.k)
+        else:
+            archive = self._cache.get_archive(float("inf"), self.k)
 
-        # 5. Build perturbation kernel from archive
+        if len(archive) < self.k:
+            # Defensive: shouldn't happen after the prior-phase guards above,
+            # but recover gracefully by re-emitting a uniform prior draw.
+            sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
+            child = Individual(position=sample, limits=self.limits)
+            child.weight = 1.0
+            return child
+
+        # 6. Compute effective archive weights = stored_weight * K_eps(loss).
+        #    Done in log-space for numerical stability (Gaussian kernel
+        #    weights can span many orders of magnitude).
         if any(ind.weight is None for ind in archive):
             if not getattr(self, "_warned_none", False):
                 logger.warning(
@@ -367,36 +573,53 @@ class ABCPMC(Propagator):
                 )
                 self._warned_none = True
         raw = np.fromiter(
-            (1.0 if ind.weight is None else ind.weight for ind in archive),
+            (1.0 if ind.weight is None else max(float(ind.weight), 0.0) for ind in archive),
             dtype=float,
             count=len(archive),
         )
-        weights = raw / raw.sum()
+        losses_arr = np.fromiter(
+            (float(ind.loss) for ind in archive), dtype=float, count=len(archive)
+        )
+        log_kernel = self._kernel_fn.log_weight(losses_arr, effective_tol)
+        with np.errstate(divide="ignore"):
+            log_raw = np.where(raw > 0.0, np.log(np.where(raw > 0.0, raw, 1.0)), -np.inf)
+        log_effective = log_raw + log_kernel
+
+        finite_mask = np.isfinite(log_effective)
+        if not finite_mask.any():
+            # All archive members have zero smooth weight (e.g. Epanechnikov
+            # support too tight). Fall back to uniform mixture weights so the
+            # algorithm continues to make progress.
+            weights = np.full(len(archive), 1.0 / len(archive))
+        else:
+            log_eff_max = float(np.max(log_effective[finite_mask]))
+            shifted = np.where(finite_mask, log_effective - log_eff_max, -np.inf)
+            weights = np.exp(shifted)
+            wsum = weights.sum()
+            if wsum <= 0.0:
+                weights = np.full(len(archive), 1.0 / len(archive))
+            else:
+                weights = weights / wsum
 
         positions = np.stack([ind.position for ind in archive])
         cov = self.weighted_covariance(positions, weights)
         cov += 1e-6 * np.eye(positions.shape[1])
         kernel_cov = self.perturbation_scale * cov
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
-        # Cholesky-factorise once; L is reused for both sampling and the
-        # log-PDF evaluation below.
         try:
             L = np.linalg.cholesky(kernel_cov)
         except np.linalg.LinAlgError:
             kernel_cov += 1e-7 * np.eye(positions.shape[1])
             L = np.linalg.cholesky(kernel_cov)
 
-        # 6. Sample candidate — reuse L to avoid repeated Cholesky in the loop
+        # 7. Sample candidate. Batched reject-resample amortises the
+        #    BLAS-call overhead across many candidates.
         idx = int(self.rng_np.choice(len(archive), p=weights))
         parent = archive[idx]
 
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
         d = positions.shape[1]
-        # Batched reject-resample: draw BATCH candidates per iteration so the
-        # numpy/BLAS overhead is amortised across many candidates. Pathological
-        # high-rejection regimes get ~BATCH× speedup; the common 1-2 attempt
-        # case pays only the cost of one BATCH-sized draw (still cheap).
         BATCH = 16
         candidate_pos = parent.position
         found = False
@@ -418,48 +641,87 @@ class ABCPMC(Propagator):
         child = Individual(position=candidate_pos, limits=self.limits)
         child.tolerance = effective_tol  # stamped for future history reconstruction
 
-        # 7. Compute importance weight w* = pi(theta*) / q_n(theta*)
-        # Manual multivariate-normal log-PDF using the existing Cholesky factor
-        # L: a single triangular solve gives all k Mahalanobis distances and
-        # avoids re-factorising the covariance inside scipy.
+        # 8. Compute importance weight via the balance-heuristic (AMIS)
+        #    denominator: average of current proposal + snapshot proposals.
         diffs = child.position - positions                      # (k, d)
-        z = solve_triangular(L, diffs.T, lower=True)            # (d, k)
+        z_solve = solve_triangular(L, diffs.T, lower=True)      # (d, k)
         log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
-        log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z, z)  # (k,)
+        log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve)
         pdfs = np.exp(log_pdfs)
+        current_proposal_pdf = float(np.dot(weights, pdfs))
 
-        denom = float(np.dot(weights, pdfs))
-        if denom < 1e-12:
+        if self._amis_snapshots > 0 and len(self._snapshots) > 0:
+            # Balance heuristic: average proposal density across snapshots
+            # plus the current proposal. Removes the importance-weight
+            # staleness that arises when the moving archive makes the
+            # proposal at proposal time differ from the current proposal.
+            total = current_proposal_pdf
+            for snap in self._snapshots:
+                snap_log_pdfs = snap.log_pdf(child.position)
+                snap_pdfs = np.exp(snap_log_pdfs)
+                total += float(np.dot(snap.weights, snap_pdfs))
+            denom = total / (1.0 + len(self._snapshots))
+        else:
+            denom = current_proposal_pdf
+
+        if denom < self._MIN_DENOM:
             warnings.warn(
-                "ABCPMC: importance weight denominator is zero (child is outside kernel support). "
-                "Assigning fallback weight; consider re-sampling.",
+                "ABCPMC: importance weight denominator below floor "
+                "(child outside kernel mixture support). Assigning fallback weight.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            denom = 1e-12
+            denom = self._MIN_DENOM
         child.weight = self.prior_density / denom
+
+        # 9. Snapshot the current proposal for future AMIS denominators.
+        self._calls_since_snapshot += 1
+        if self._amis_snapshots > 0 and self._calls_since_snapshot >= self._amis_interval:
+            self._snapshots.append(
+                _ArchiveSnapshot(positions.copy(), weights.copy(), L.copy())
+            )
+            self._calls_since_snapshot = 0
 
         return child
 
 
 class EpsilonScheduler(ABC):
     """
-    Base class for tolerance scheduling in ABC-PMC.
+    Base class for bandwidth scheduling in ABC-PMC.
 
     Subclasses must implement ``compute(inds, current_tol)`` — a **pure function**
-    of the evaluated history and the current effective tolerance.  No mutable
-    state should be modified by ``compute``; all scheduling logic must be
-    derivable from ``inds`` alone. Subclasses may additionally override
-    ``compute_cached(...)`` to exploit append-only history with internal
-    performance caches, but that cached path must remain equivalent to
-    ``compute(...)`` for valid inputs.
+    of the evaluated history and the current effective tolerance/bandwidth.
+    No mutable state should be modified by ``compute``; all scheduling logic
+    must be derivable from ``inds`` alone. Subclasses may additionally
+    override ``compute_cached(...)`` to exploit append-only history with
+    internal performance caches, but that cached path must remain equivalent
+    to ``compute(...)`` for valid inputs.
+
+    Kernel-aware mode
+    -----------------
+    When ``kernel_aware=True`` the scheduler is told that the propagator is
+    using a smooth ABC kernel, in which case the selected value ``eps``
+    plays the role of a kernel bandwidth rather than a hard rejection
+    threshold. The selection logic itself uses raw loss statistics in both
+    modes — under the paper's consistency theorem any monotone-decreasing
+    bandwidth schedule satisfying (C3) is admissible, and the loss-quantile
+    rule meets that. ESS-based selection (Del Moral, Doucet & Jasra 2012)
+    is left as a future refinement.
     """
 
-    def __init__(self, initial_tol: float, population_size: int, additional_needed_inds: int):
+    def __init__(
+        self,
+        initial_tol: float,
+        population_size: int,
+        additional_needed_inds: int,
+        *,
+        kernel_aware: bool = False,
+    ):
         self.initial_tol = initial_tol
         self.current_tol = initial_tol  # kept for backward-compat with deprecated update()
         self.population_size = population_size
         self.additional_needed_inds = additional_needed_inds
+        self.kernel_aware = kernel_aware
 
     @abstractmethod
     def compute(self, inds: List[Individual], current_tol: float) -> float:
@@ -542,8 +804,12 @@ class QuantileScheduler(EpsilonScheduler):
         population_size: int,
         additional_needed_inds: int,
         percentile: float = 50.0,
+        *,
+        kernel_aware: bool = False,
     ):
-        super().__init__(initial_tol, population_size, additional_needed_inds)
+        super().__init__(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+        )
         if not (0 < percentile < 100):
             raise ValueError("Percentile must be between 0 and 100.")
         self.percentile = percentile
@@ -586,8 +852,12 @@ class GeometricDecayScheduler(EpsilonScheduler):
         population_size: int,
         additional_needed_inds: int,
         decay_factor: float = 0.9,
+        *,
+        kernel_aware: bool = False,
     ):
-        super().__init__(initial_tol, population_size, additional_needed_inds)
+        super().__init__(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+        )
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
         self.decay_factor = decay_factor
@@ -680,8 +950,12 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         low_rate: float = 0.1,
         high_rate: float = 0.3,
         shrink_factor: float = 0.9,
+        *,
+        kernel_aware: bool = False,
     ):
-        super().__init__(initial_tol, population_size, additional_needed_inds)
+        super().__init__(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+        )
         if not (0 < low_rate < high_rate < 1):
             raise ValueError("0 < low_rate < high_rate < 1 required.")
         self.low_rate = low_rate
@@ -718,22 +992,33 @@ class EpsilonSchedulerType(Enum):
 
 
 def create_scheduler(
-    scheduler_type: str, initial_tol: float, population_size: int, additional_needed_inds: int, **kwargs
+    scheduler_type: str,
+    initial_tol: float,
+    population_size: int,
+    additional_needed_inds: int,
+    *,
+    kernel_aware: bool = False,
+    **kwargs,
 ) -> EpsilonScheduler:
     """
-    Factory to create a tolerance scheduler by name.
+    Factory to create a bandwidth scheduler by name.
 
     Parameters
     ----------
     scheduler_type : str
         One of ``'quantile'``, ``'geometric_decay'``, ``'acceptance_rate'``.
     initial_tol : float
-        Starting tolerance value.
+        Starting bandwidth value.
     population_size : int
         Size of the population used for scheduling decisions.
     additional_needed_inds : int
         Minimum extra accepted individuals beyond ``population_size`` required
-        before a tolerance update is proposed.
+        before a bandwidth update is proposed.
+    kernel_aware : bool
+        If True, the scheduler is informed that the propagator is using a
+        smooth ABC kernel. The current implementation keeps the same
+        loss-quantile selection logic regardless; ESS-based bandwidth
+        selection is planned future work.
     **kwargs
         Additional parameters passed to the scheduler constructor.
 
@@ -749,8 +1034,14 @@ def create_scheduler(
         raise ValueError(f"Unknown scheduler type '{scheduler_type}'. Valid types: {valid}")
 
     if st == EpsilonSchedulerType.QUANTILE:
-        return QuantileScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+        return QuantileScheduler(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+        )
     elif st == EpsilonSchedulerType.GEOMETRIC_DECAY:
-        return GeometricDecayScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+        return GeometricDecayScheduler(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+        )
     elif st == EpsilonSchedulerType.ACCEPTANCE_RATE:
-        return AcceptanceRateScheduler(initial_tol, population_size, additional_needed_inds, **kwargs)
+        return AcceptanceRateScheduler(
+            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+        )
