@@ -40,7 +40,7 @@ if __name__ == "__main__":
     # low = np.array([v[0] for v in limits.values()])
     # high = np.array([v[1] for v in limits.values()])
     # start_point = np.random.default_rng(seed=config.seed + 235231).uniform(low=low, high=high)
-    propagator = ABCPMC(loss_fn=function, limits=limits)
+    propagator = ABCPMC(limits=limits)
     # Set up Propulator performing actual optimization.
     propulator = Propulator(
         loss_fn=function,

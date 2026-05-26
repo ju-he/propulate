@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 from scipy.linalg import solve_triangular
+from scipy.special import logsumexp
 from sortedcontainers import SortedKeyList
 
 from ..population import Individual
@@ -121,6 +122,23 @@ def _make_kernel(name: str) -> _Kernel:
             f"Unknown ABCPMC kernel '{name}'. "
             f"Valid kernels: {sorted(_KERNEL_REGISTRY)}"
         )
+
+
+def _log_mixture(weights: np.ndarray, log_pdfs: np.ndarray) -> float:
+    """
+    Log of a categorical mixture density: log(sum_j w_j * exp(log_pdf_j)).
+
+    Computed in log-space via logsumexp to avoid underflow when log_pdfs
+    span many decades (Gaussian kernel in d >= 10 with tight Sigma).
+
+    Zero weights are mapped to -inf log-weight so they drop out of the sum.
+    Returns -inf if all log-weights are -inf (e.g. empty support).
+    """
+    weights = np.asarray(weights, dtype=float)
+    log_pdfs = np.asarray(log_pdfs, dtype=float)
+    with np.errstate(divide="ignore"):
+        log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
+    return float(logsumexp(log_w + log_pdfs))
 
 
 class _ArchiveSnapshot:
@@ -293,6 +311,7 @@ class ABCPMC(Propagator):
 
     _MAX_RESAMPLE_ATTEMPTS = 1000
     _MIN_DENOM = 1e-12  # numerical floor for the importance-weight denominator
+    _MAX_WEIGHT_RETRIES = 5  # retries when the AMIS denominator underflows the floor
 
     def __init__(
         self,
@@ -612,67 +631,101 @@ class ABCPMC(Propagator):
             kernel_cov += 1e-7 * np.eye(positions.shape[1])
             L = np.linalg.cholesky(kernel_cov)
 
-        # 7. Sample candidate. Batched reject-resample amortises the
-        #    BLAS-call overhead across many candidates.
-        idx = int(self.rng_np.choice(len(archive), p=weights))
-        parent = archive[idx]
-
+        # 7+8. Sample candidate and assign its importance weight.
+        #
+        # Retry up to _MAX_WEIGHT_RETRIES times if the AMIS denominator
+        # underflows the floor: each retry draws a fresh parent + a fresh
+        # perturbation. This replaces the prior _MIN_DENOM floor (which
+        # produced outlier weights ~prior/1e-12 capable of swamping the
+        # mixture). On final exhaustion the candidate keeps weight = 0,
+        # which drops out of weighted_covariance and resampling.
         lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
         d = positions.shape[1]
         BATCH = 16
-        candidate_pos = parent.position
-        found = False
-        for _ in range(self._MAX_RESAMPLE_ATTEMPTS // BATCH):
-            z = self.rng_np.standard_normal((BATCH, d))
-            cands = parent.position + z @ L.T
-            in_box = np.all((cands >= lo) & (cands <= hi), axis=1)
-            if in_box.any():
-                candidate_pos = cands[int(np.argmax(in_box))]
-                found = True
+        log_min = np.log(self._MIN_DENOM)
+
+        candidate_pos: np.ndarray
+        fallback_to_prior = False
+        log_denom = -np.inf
+        weight_ok = False
+
+        for retry in range(self._MAX_WEIGHT_RETRIES):
+            # Parent selection + batched reject-resample inside the box.
+            idx = int(self.rng_np.choice(len(archive), p=weights))
+            parent = archive[idx]
+            candidate_pos = parent.position
+            found = False
+            for _ in range(self._MAX_RESAMPLE_ATTEMPTS // BATCH):
+                z = self.rng_np.standard_normal((BATCH, d))
+                cands = parent.position + z @ L.T
+                in_box = np.all((cands >= lo) & (cands <= hi), axis=1)
+                if in_box.any():
+                    candidate_pos = cands[int(np.argmax(in_box))]
+                    found = True
+                    break
+
+            if not found:
+                # Kernel cov wider than the box: truncated-Gaussian mixture
+                # has effectively no mass inside. Fall back to a uniform
+                # prior draw (paper §3.4); the proposal equals the prior,
+                # IS weight pi/pi = 1.0. No further retries needed.
+                sample = {key: self.rng.uniform(limit[0], limit[1]) for key, limit in self.limits.items()}
+                candidate_pos = np.array([sample[k] for k in self.limits], dtype=float)
+                logger.debug(
+                    "ABCPMC: reject-resample exhausted %d attempts; falling back to uniform-prior draw.",
+                    self._MAX_RESAMPLE_ATTEMPTS,
+                )
+                fallback_to_prior = True
+                weight_ok = True
                 break
-        if not found:
-            candidate_pos = np.clip(candidate_pos, lo, hi)
-            logger.debug(
-                "ABCPMC: reject-resample exhausted %d attempts; falling back to boundary clipping.",
-                self._MAX_RESAMPLE_ATTEMPTS,
-            )
+
+            # Balance-heuristic (AMIS) denominator in log-space. logsumexp
+            # keeps the mixture stable when Gaussian-kernel PDFs span many
+            # decades (typical in d >= 10).
+            diffs = candidate_pos - positions
+            z_solve = solve_triangular(L, diffs.T, lower=True)
+            log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
+            log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve)
+            log_current = _log_mixture(weights, log_pdfs)
+
+            if self._amis_snapshots > 0 and len(self._snapshots) > 0:
+                log_mixtures = [log_current]
+                for snap in self._snapshots:
+                    snap_log_pdfs = snap.log_pdf(candidate_pos)
+                    log_mixtures.append(_log_mixture(snap.weights, snap_log_pdfs))
+                log_denom = float(logsumexp(np.asarray(log_mixtures))) - np.log(
+                    1.0 + len(self._snapshots)
+                )
+            else:
+                log_denom = log_current
+
+            if np.isfinite(log_denom) and log_denom >= log_min:
+                weight_ok = True
+                break
+            # otherwise: retry with a fresh parent + fresh perturbation
 
         child = Individual(position=candidate_pos, limits=self.limits)
         child.tolerance = effective_tol  # stamped for future history reconstruction
 
-        # 8. Compute importance weight via the balance-heuristic (AMIS)
-        #    denominator: average of current proposal + snapshot proposals.
-        diffs = child.position - positions                      # (k, d)
-        z_solve = solve_triangular(L, diffs.T, lower=True)      # (d, k)
-        log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
-        log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve)
-        pdfs = np.exp(log_pdfs)
-        current_proposal_pdf = float(np.dot(weights, pdfs))
-
-        if self._amis_snapshots > 0 and len(self._snapshots) > 0:
-            # Balance heuristic: average proposal density across snapshots
-            # plus the current proposal. Removes the importance-weight
-            # staleness that arises when the moving archive makes the
-            # proposal at proposal time differ from the current proposal.
-            total = current_proposal_pdf
-            for snap in self._snapshots:
-                snap_log_pdfs = snap.log_pdf(child.position)
-                snap_pdfs = np.exp(snap_log_pdfs)
-                total += float(np.dot(snap.weights, snap_pdfs))
-            denom = total / (1.0 + len(self._snapshots))
+        if fallback_to_prior:
+            child.weight = 1.0
+        elif weight_ok:
+            child.weight = float(self.prior_density * np.exp(-log_denom))
         else:
-            denom = current_proposal_pdf
-
-        if denom < self._MIN_DENOM:
-            warnings.warn(
-                "ABCPMC: importance weight denominator below floor "
-                "(child outside kernel mixture support). Assigning fallback weight.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            denom = self._MIN_DENOM
-        child.weight = self.prior_density / denom
+            # All retries underflowed: the kernel mixture has effectively no
+            # support at the sampled neighbourhood. Drop this candidate from
+            # the proposal mixture by assigning weight = 0; downstream
+            # weighted_covariance and resampling already tolerate zero rows.
+            if not getattr(self, "_warned_zero_weight", False):
+                warnings.warn(
+                    "ABCPMC: importance weight denominator below floor across "
+                    f"{self._MAX_WEIGHT_RETRIES} retries; assigning weight=0.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_zero_weight = True
+            child.weight = 0.0
 
         # 9. Snapshot the current proposal for future AMIS denominators.
         self._calls_since_snapshot += 1

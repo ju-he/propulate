@@ -367,12 +367,14 @@ class TestABCPMCEdgeCases:
         assert "weight=None" in caplog.text
 
     def test_near_zero_denominator_handled(self, monkeypatch):
+        """Persistent denominator underflow yields weight=0 (no 1e12 outliers)."""
         abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
 
         def force_underflow(*args, **kwargs):
-            # Return huge Mahalanobis residuals so the log-PDF underflows to 0,
-            # forcing the near-zero denominator branch.
+            # Return huge Mahalanobis residuals so every retry's log-PDF
+            # underflows. After _MAX_WEIGHT_RETRIES the candidate must
+            # receive weight=0 rather than a 1e12 floor weight.
             b = args[1]
             return np.full_like(b, 1e8, dtype=float)
 
@@ -382,9 +384,9 @@ class TestABCPMCEdgeCases:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", RuntimeWarning)
             child = abc(inds=inds)
-        assert any("importance weight denominator" in str(w.message) for w in caught)
+        assert any("weight=0" in str(w.message) for w in caught)
         assert np.isfinite(child.weight)
-        assert child.weight == pytest.approx(1e12)
+        assert child.weight == 0.0
 
     def test_weights_reasonable_near_boundaries(self):
         boundary_limits = {"x": (0.0, 0.05), "y": (0.0, 0.05)}
@@ -425,6 +427,113 @@ class TestABCPMCEdgeCases:
             assert np.all(child.position >= lo)
             assert np.all(child.position <= hi)
             assert np.isfinite(child.weight)
+
+
+class TestW1LogSpaceAMIS:
+    """W1.1 — log-space AMIS assembly stability at higher d."""
+
+    def test_d15_gaussian_kernel_finite_weights_no_warning(self):
+        """200 archive-phase calls in d=15 Gaussian-kernel mode: all weights finite, no RuntimeWarning."""
+        limits = {f"x{i}": (0.0, 1.0) for i in range(15)}
+        abc = ABCPMC(
+            limits,
+            k=10,
+            tol=1.0,
+            scheduler_type="quantile",
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel="gaussian",
+            amis_snapshots=5,
+            amis_interval=4,
+            rng=random.Random(0),
+        )
+        history = []
+        rng_np = np.random.default_rng(0)
+        # bootstrap
+        for i in range(10):
+            child = abc(history)
+            child.loss = float(rng_np.uniform(0.0, 2.0))
+            child.generation = i
+            history.append(child)
+        # 200 archive-phase calls, capturing warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            for i in range(10, 210):
+                child = abc(history)
+                child.loss = float(rng_np.uniform(0.0, 2.0))
+                child.generation = i
+                history.append(child)
+                assert np.isfinite(child.weight)
+                assert child.weight >= 0.0
+        amis_warns = [w for w in caught if "importance weight denominator" in str(w.message)]
+        assert amis_warns == [], (
+            f"Unexpected AMIS underflow warnings in log-space path: "
+            f"{[str(w.message) for w in amis_warns]}"
+        )
+
+
+class TestW1BoundaryFallback:
+    """W1.2 — uniform-prior-draw fallback when kernel cov exceeds the box."""
+
+    def test_wide_kernel_falls_back_to_uniform_with_weight_one(self):
+        """Force kernel cov ≫ box → fallback to uniform-prior draw, weight=1.0."""
+        # Tiny box + huge perturbation_scale + widely-scattered archive →
+        # kernel cov dominates the box on every retry → fallback path fires.
+        tiny_limits = {"x": (0.0, 1e-6), "y": (0.0, 1e-6)}
+        abc = ABCPMC(
+            tiny_limits,
+            k=3,
+            tol=10.0,
+            perturbation_scale=1e6,
+            rng=random.Random(0),
+        )
+        inds = []
+        positions = [(0.0, 0.0), (1e-6, 1e-6), (0.0, 1e-6)]
+        for i, (x, y) in enumerate(positions * 2):
+            ind = Individual({"x": x, "y": y}, tiny_limits, tolerance=10.0, generation=i)
+            ind.loss = 0.1 * (i + 1)
+            ind.weight = 1.0
+            inds.append(ind)
+
+        lo = np.array([0.0, 0.0])
+        hi = np.array([1e-6, 1e-6])
+        for _ in range(20):
+            child = abc(inds=inds)
+            # Position must remain in the box (uniform-prior draw, not clipped).
+            assert np.all(child.position >= lo)
+            assert np.all(child.position <= hi)
+            # Fallback semantics: pi/pi = 1.0.
+            assert child.weight == 1.0
+            # Tolerance still stamped per paper §3.4.
+            assert child.tolerance is not None
+
+
+class TestW1RetryExhaustion:
+    """W1.3 — reject-and-resample-parent retry replaces the 1e12 weight floor."""
+
+    def test_partial_retry_then_success_yields_normal_weight(self, monkeypatch):
+        """If the first call underflows but a subsequent retry succeeds, weight is normal (not 0, not 1e12)."""
+        from propulate.propagators import abcpmc as mod
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
+
+        real_solve = mod.solve_triangular
+        call_count = {"n": 0}
+
+        def underflow_then_real(L, b, lower=True):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return np.full_like(b, 1e8, dtype=float)  # underflow once
+            return real_solve(L, b, lower=lower)
+
+        monkeypatch.setattr(mod, "solve_triangular", underflow_then_real)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            child = abc(inds=inds)
+        assert np.isfinite(child.weight)
+        assert 0.0 < child.weight < 1e12  # not 0 (retry succeeded), not floor (no clamp)
+        # weight=0 warning must NOT fire on partial-retry success.
+        assert not any("weight=0" in str(w.message) for w in caught)
 
 
 class TestABCPMCSchedulerGuard:
