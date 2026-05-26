@@ -272,7 +272,12 @@ class ABCPMC(Propagator):
     - ``"hard"`` — ``1[rho < eps]``. Classical rejection-style ABC-PMC. A
       prior phase samples uniformly from the search space until the archive
       contains ``k`` particles with ``loss < eps``; past that, the archive is
-      the top-``k`` by lowest loss within the tolerance.
+      the **top-k by lowest loss among individuals with ``loss < eps``** —
+      a quantile-trimmed rejection rule, not strict ``loss < eps`` retention
+      (see ``select_archive``). At steady state with k particles below eps
+      the two coincide, but when the scheduler tightens eps the top-k rule
+      can keep accepted particles that the strict rule would drop on the
+      next call.
     - ``"gaussian"`` — ``exp(-rho^2 / 2 eps^2)``. Smooth-kernel ABC
       (Wilkinson 2013). Every particle contributes proportionally; the
       prior-vs-archive phase distinction is replaced by a bootstrap rule
@@ -281,8 +286,12 @@ class ABCPMC(Propagator):
       supported smooth kernel; particles with ``rho > eps`` contribute zero.
 
     For smooth kernels (``"gaussian"`` / ``"epanechnikov"``) the bandwidth
-    ``eps`` is selected by the scheduler in its *kernel-aware* mode (e.g.
-    target-ESS bisection for ``QuantileScheduler``).
+    ``eps`` is selected by the scheduler in its *kernel-aware* mode (when
+    ``kernel_aware=True`` and an ESS-bisection rule is implemented). The
+    current schedulers accept and store the flag but use the loss-quantile
+    / acceptance-rate / geometric-decay rule regardless; target-ESS
+    bisection (Del Moral, Doucet & Jasra 2012) is wired up in W3.1 of the
+    asynchronous-ABC paper plan.
 
     AMIS reweighting
     ----------------
@@ -324,7 +333,7 @@ class ABCPMC(Propagator):
         min_tol: Optional[float] = None,
         rng: Optional[random.Random] = None,
         kernel: str = "hard",
-        amis_snapshots: int = 0,
+        amis_snapshots: int = 20,
         amis_interval: Optional[int] = None,
         **kwargs: Union[float, int, str],
     ) -> None:
@@ -360,9 +369,10 @@ class ABCPMC(Propagator):
             (compactly supported). Default ``'hard'`` for back-compat.
         amis_snapshots : int
             Number of past proposal snapshots to retain for streaming-AMIS
-            balance-heuristic reweighting (Cornuet et al. 2012). Default 0
-            (legacy single-proposal weighting). Recommended for smooth
-            kernels: ``20``.
+            balance-heuristic reweighting (Cornuet et al. 2012). Default
+            ``20``. Set to ``0`` to opt into the legacy single-current-proposal
+            weighting (not recommended; the cumulative-mixture denominator
+            is what the asynchronous-ABC consistency argument relies on).
         amis_interval : int, optional
             Number of ``__call__`` invocations between snapshots. Defaults
             to ``k`` so each snapshot represents one archive turnover.
@@ -413,6 +423,10 @@ class ABCPMC(Propagator):
         self._snapshots: deque = deque(maxlen=amis_snapshots) if amis_snapshots > 0 else deque(maxlen=1)
         self._calls_since_snapshot = 0
 
+        # One-shot warning flags (set on first emission).
+        self._warned_none: bool = False
+        self._warned_zero_weight: bool = False
+
     def _update_cache(self, inds: List[Individual]) -> None:
         """Incrementally update the internal performance cache."""
         n = len(inds)
@@ -447,7 +461,16 @@ class ABCPMC(Propagator):
 
     def select_archive(self, inds: List[Individual], tol: float) -> List[Individual]:
         """
-        Return up to ``k`` best accepted individuals as the active archive.
+        Return the top-``k`` accepted individuals (by lowest loss, ascending).
+
+        This implements a **quantile-trimmed rejection rule**: from the
+        individuals with ``loss < tol`` we keep only the best ``k`` by loss,
+        not all of them. At steady state with the archive saturated below
+        ``tol`` the two rules coincide; under a tightening schedule the
+        top-k rule biases the archive slightly toward the mode relative to
+        a strict ``loss < tol`` rule. Documented in §3.2 of the
+        asynchronous-ABC paper plan; under smooth kernels the kernel weight
+        ``K_eps(rho)`` provides the additional decay.
 
         Parameters
         ----------
@@ -584,7 +607,7 @@ class ABCPMC(Propagator):
         #    Done in log-space for numerical stability (Gaussian kernel
         #    weights can span many orders of magnitude).
         if any(ind.weight is None for ind in archive):
-            if not getattr(self, "_warned_none", False):
+            if not self._warned_none:
                 logger.warning(
                     "ABCPMC: one or more archive individuals have weight=None "
                     "(likely from an external propagator). Falling back to weight=1.0 "
@@ -717,7 +740,7 @@ class ABCPMC(Propagator):
             # support at the sampled neighbourhood. Drop this candidate from
             # the proposal mixture by assigning weight = 0; downstream
             # weighted_covariance and resampling already tolerate zero rows.
-            if not getattr(self, "_warned_zero_weight", False):
+            if not self._warned_zero_weight:
                 warnings.warn(
                     "ABCPMC: importance weight denominator below floor across "
                     f"{self._MAX_WEIGHT_RETRIES} retries; assigning weight=0.",
