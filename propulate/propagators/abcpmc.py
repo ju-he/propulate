@@ -335,6 +335,7 @@ class ABCPMC(Propagator):
         kernel: str = "hard",
         amis_snapshots: int = 20,
         amis_interval: Optional[int] = None,
+        ess_target: float = 0.95,
         **kwargs: Union[float, int, str],
     ) -> None:
         """
@@ -376,6 +377,13 @@ class ABCPMC(Propagator):
         amis_interval : int, optional
             Number of ``__call__`` invocations between snapshots. Defaults
             to ``k`` so each snapshot represents one archive turnover.
+        ess_target : float
+            Target relative ESS for the kernel-aware bandwidth bisection
+            (Del Moral, Doucet & Jasra 2012). Active only when ``kernel``
+            is a smooth kernel (``"gaussian"`` or ``"epanechnikov"``);
+            ignored for the hard kernel which retains the loss-quantile /
+            acceptance-rate / geometric-decay schedule.  Must lie in
+            ``(0, 1]``; default ``0.95``.
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -396,12 +404,17 @@ class ABCPMC(Propagator):
         self.kernel_name = kernel
         self._kernel_fn: _Kernel = _make_kernel(kernel)
         self._kernel_aware = kernel != "hard"
+        if not (0.0 < ess_target <= 1.0):
+            raise ValueError("ess_target must be in (0, 1].")
+        self.ess_target = float(ess_target)
         self.tolerance_scheduler = create_scheduler(
             scheduler_type,
             tol,
             k,
             self.additional_needed_inds,
             kernel_aware=self._kernel_aware,
+            kernel_fn=self._kernel_fn,
+            ess_target=self.ess_target,
             **kwargs,
         )
         self.rng_np = np.random.default_rng(
@@ -775,15 +788,26 @@ class EpsilonScheduler(ABC):
 
     Kernel-aware mode
     -----------------
-    When ``kernel_aware=True`` the scheduler is told that the propagator is
-    using a smooth ABC kernel, in which case the selected value ``eps``
-    plays the role of a kernel bandwidth rather than a hard rejection
-    threshold. The selection logic itself uses raw loss statistics in both
-    modes — under the paper's consistency theorem any monotone-decreasing
-    bandwidth schedule satisfying (C3) is admissible, and the loss-quantile
-    rule meets that. ESS-based selection (Del Moral, Doucet & Jasra 2012)
-    is left as a future refinement.
+    When ``kernel_aware=True`` and a smooth kernel function is supplied, the
+    scheduler selects ε by bisection on the **relative kernel-weighted ESS**
+    rather than from raw loss statistics. The target ratio ``ess_target``
+    (default 0.95) controls how aggressive the tightening is: at each call
+    the scheduler proposes the largest ε ≤ ``current_tol`` such that
+
+        ESS(ε) / N ≈ ess_target,                ESS(ε) = (Σ w·K_ε)² / Σ(w·K_ε)²
+
+    where ``w`` is the stored core importance weight and ``K_ε(ρ)`` is the
+    smooth ABC kernel. This is the Del Moral, Doucet & Jasra 2012 adaptive
+    bandwidth rule restricted to smooth-kernel ABC.
+
+    For the hard kernel or ``kernel_aware=False`` the schedulers retain
+    their original loss-quantile / acceptance-rate / geometric-decay
+    selection rules.
     """
+
+    # Bisection settings; protected so subclasses can tune them.
+    _BISECT_ITERATIONS = 32
+    _BISECT_TOL = 1e-4  # absolute tolerance on relative ESS
 
     def __init__(
         self,
@@ -792,12 +816,117 @@ class EpsilonScheduler(ABC):
         additional_needed_inds: int,
         *,
         kernel_aware: bool = False,
+        kernel_fn: Optional["_Kernel"] = None,
+        ess_target: float = 0.95,
     ):
+        if not (0.0 < ess_target <= 1.0):
+            raise ValueError("ess_target must be in (0, 1].")
         self.initial_tol = initial_tol
         self.current_tol = initial_tol  # kept for backward-compat with deprecated update()
         self.population_size = population_size
         self.additional_needed_inds = additional_needed_inds
         self.kernel_aware = kernel_aware
+        self.kernel_fn = kernel_fn
+        self.ess_target = float(ess_target)
+
+    # ------------------------------------------------------------------
+    # Kernel-aware target-ESS bisection (Del Moral, Doucet & Jasra 2012)
+    # ------------------------------------------------------------------
+
+    def _use_kernel_aware(self) -> bool:
+        """Return True when the kernel-aware ESS bisection path is active."""
+        if not self.kernel_aware:
+            return False
+        kfn = self.kernel_fn
+        if kfn is None:
+            return False
+        # Hard kernel is degenerate — ESS is a step function in ε, so
+        # bisection isn't meaningful. Fall back to the quantile/etc. rule.
+        return getattr(kfn, "name", "") != "hard"
+
+    @staticmethod
+    def _relative_ess(weights: np.ndarray, losses: np.ndarray, kfn: "_Kernel", eps: float) -> float:
+        """Relative kernel-weighted ESS in [0, 1] at bandwidth *eps*.
+
+        Computed in log-space via logsumexp to remain stable for Gaussian
+        kernels in regimes where K_eps(ρ) spans many decades. Returns 0.0
+        when the effective weight vector is all zero.
+        """
+        if weights.size == 0:
+            return 0.0
+        log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
+        log_k = kfn.log_weight(losses, eps)
+        log_eff = log_w + log_k
+        if not np.isfinite(log_eff).any():
+            return 0.0
+        log_sum = float(logsumexp(log_eff))
+        log_sum_sq = float(logsumexp(2.0 * log_eff))
+        # ESS = exp(2 log_sum - log_sum_sq); divide by N for the relative form.
+        return float(np.exp(2.0 * log_sum - log_sum_sq) / weights.size)
+
+    def _bisect_target_ess(
+        self, weights: np.ndarray, losses: np.ndarray, current_tol: float
+    ) -> float:
+        """Return the largest ε ∈ [0, current_tol] with relative ESS ≈ target.
+
+        If the relative ESS at ``current_tol`` is already below the target
+        (e.g. the kernel mixture is already concentrated), no tightening is
+        possible — return ``current_tol``. Otherwise bisect.
+        """
+        kfn = self.kernel_fn
+        assert kfn is not None  # guarded by _use_kernel_aware
+        if current_tol <= 0.0 or weights.size == 0:
+            return current_tol
+
+        target = self.ess_target
+        ess_high = self._relative_ess(weights, losses, kfn, current_tol)
+        if ess_high <= target + self._BISECT_TOL:
+            # Already at or below target — bisection would only loosen ε.
+            return current_tol
+
+        # Lower bound: positive, well below current_tol. Use 1e-6 * current_tol
+        # rather than 0 so the kernel-weight evaluation stays in the smooth
+        # regime even for the Gaussian kernel.
+        low = max(1e-12, 1e-6 * current_tol)
+        high = current_tol
+        # If even the lower bound is above target, target is unreachable
+        # without going lower than `low`; clip to `low`.
+        ess_low = self._relative_ess(weights, losses, kfn, low)
+        if ess_low >= target:
+            return low
+
+        for _ in range(self._BISECT_ITERATIONS):
+            mid = 0.5 * (low + high)
+            ess_mid = self._relative_ess(weights, losses, kfn, mid)
+            if abs(ess_mid - target) <= self._BISECT_TOL:
+                return mid
+            if ess_mid > target:
+                # ε too lax for target — tighten.
+                high = mid
+            else:
+                # ε too tight — relax.
+                low = mid
+        return 0.5 * (low + high)
+
+    def _kernel_aware_from_accepted(
+        self,
+        current_tol: float,
+        accepted: List[Individual],
+    ) -> float:
+        """Shared dispatch point for subclasses' kernel-aware path."""
+        if len(accepted) < self.population_size + self.additional_needed_inds:
+            return current_tol
+        # Use stored core weight; fall back to 1.0 for individuals from an
+        # external propagator (matches the same fallback in ABCPMC.__call__).
+        weights = np.fromiter(
+            (1.0 if ind.weight is None else max(float(ind.weight), 0.0) for ind in accepted),
+            dtype=float,
+            count=len(accepted),
+        )
+        losses = np.fromiter(
+            (float(ind.loss) for ind in accepted), dtype=float, count=len(accepted)
+        )
+        return self._bisect_target_ess(weights, losses, current_tol)
 
     @abstractmethod
     def compute(self, inds: List[Individual], current_tol: float) -> float:
@@ -882,9 +1011,16 @@ class QuantileScheduler(EpsilonScheduler):
         percentile: float = 50.0,
         *,
         kernel_aware: bool = False,
+        kernel_fn: Optional["_Kernel"] = None,
+        ess_target: float = 0.95,
     ):
         super().__init__(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+            initial_tol,
+            population_size,
+            additional_needed_inds,
+            kernel_aware=kernel_aware,
+            kernel_fn=kernel_fn,
+            ess_target=ess_target,
         )
         if not (0 < percentile < 100):
             raise ValueError("Percentile must be between 0 and 100.")
@@ -892,6 +1028,8 @@ class QuantileScheduler(EpsilonScheduler):
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         accepted = [ind for ind in inds if ind.loss < current_tol]
+        if self._use_kernel_aware():
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         n = len(accepted)
         if n < self.population_size + self.additional_needed_inds:
             return current_tol
@@ -899,6 +1037,10 @@ class QuantileScheduler(EpsilonScheduler):
         return float(losses_sorted[int(self.percentile / 100.0 * n)])
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        if self._use_kernel_aware():
+            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
+            accepted = list(accepted_by_loss[:n_accepted])
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         n = accepted_by_loss.bisect_key_left(current_tol)
         if n < self.population_size + self.additional_needed_inds:
             return current_tol
@@ -930,9 +1072,16 @@ class GeometricDecayScheduler(EpsilonScheduler):
         decay_factor: float = 0.9,
         *,
         kernel_aware: bool = False,
+        kernel_fn: Optional["_Kernel"] = None,
+        ess_target: float = 0.95,
     ):
         super().__init__(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+            initial_tol,
+            population_size,
+            additional_needed_inds,
+            kernel_aware=kernel_aware,
+            kernel_fn=kernel_fn,
+            ess_target=ess_target,
         )
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
@@ -963,6 +1112,9 @@ class GeometricDecayScheduler(EpsilonScheduler):
         float
             Proposed tolerance for the next epoch.
         """
+        if self._use_kernel_aware():
+            accepted = [ind for ind in inds if ind.loss < current_tol]
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         batch_size = self.population_size + self.additional_needed_inds
         accepted_all = sorted(
             [ind for ind in inds if ind.loss < self.initial_tol],
@@ -980,6 +1132,10 @@ class GeometricDecayScheduler(EpsilonScheduler):
         return tol
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        if self._use_kernel_aware():
+            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
+            accepted = list(accepted_by_loss[:n_accepted])
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         batch_size = self.population_size + self.additional_needed_inds
         tol = self._cached_tol
         consumed = self._cached_consumed
@@ -1028,9 +1184,16 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         shrink_factor: float = 0.9,
         *,
         kernel_aware: bool = False,
+        kernel_fn: Optional["_Kernel"] = None,
+        ess_target: float = 0.95,
     ):
         super().__init__(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware
+            initial_tol,
+            population_size,
+            additional_needed_inds,
+            kernel_aware=kernel_aware,
+            kernel_fn=kernel_fn,
+            ess_target=ess_target,
         )
         if not (0 < low_rate < high_rate < 1):
             raise ValueError("0 < low_rate < high_rate < 1 required.")
@@ -1039,6 +1202,9 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         self.shrink_factor = shrink_factor
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
+        if self._use_kernel_aware():
+            accepted = [ind for ind in inds if ind.loss < current_tol]
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         window_size = self.population_size + self.additional_needed_inds
         if len(inds) < window_size:
             return current_tol
@@ -1050,6 +1216,10 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         return current_tol
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
+        if self._use_kernel_aware():
+            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
+            accepted = list(accepted_by_loss[:n_accepted])
+            return self._kernel_aware_from_accepted(current_tol, accepted)
         window_size = self.population_size + self.additional_needed_inds
         if len(inds_by_gen) < window_size:
             return current_tol
@@ -1074,6 +1244,8 @@ def create_scheduler(
     additional_needed_inds: int,
     *,
     kernel_aware: bool = False,
+    kernel_fn: Optional["_Kernel"] = None,
+    ess_target: float = 0.95,
     **kwargs,
 ) -> EpsilonScheduler:
     """
@@ -1091,12 +1263,20 @@ def create_scheduler(
         Minimum extra accepted individuals beyond ``population_size`` required
         before a bandwidth update is proposed.
     kernel_aware : bool
-        If True, the scheduler is informed that the propagator is using a
-        smooth ABC kernel. The current implementation keeps the same
-        loss-quantile selection logic regardless; ESS-based bandwidth
-        selection is planned future work.
+        When True (and ``kernel_fn`` is a smooth kernel), the scheduler
+        selects ε by target-ESS bisection (Del Moral, Doucet & Jasra 2012)
+        rather than from raw loss statistics. The original selection rule
+        is preserved as the fallback for hard kernels and for
+        ``kernel_aware=False``.
+    kernel_fn : :class:`_Kernel`, optional
+        The smooth ABC kernel used by the propagator. Required for
+        ``kernel_aware=True`` bisection; ignored otherwise.
+    ess_target : float
+        Target relative ESS for the bisection rule (default 0.95). Must be
+        in ``(0, 1]``.
     **kwargs
-        Additional parameters passed to the scheduler constructor.
+        Additional parameters passed to the scheduler constructor
+        (e.g. ``percentile``, ``decay_factor``, ``low_rate``/``high_rate``).
 
     Returns
     -------
@@ -1109,15 +1289,18 @@ def create_scheduler(
         valid = [e.value for e in EpsilonSchedulerType]
         raise ValueError(f"Unknown scheduler type '{scheduler_type}'. Valid types: {valid}")
 
+    common = dict(
+        kernel_aware=kernel_aware, kernel_fn=kernel_fn, ess_target=ess_target
+    )
     if st == EpsilonSchedulerType.QUANTILE:
         return QuantileScheduler(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+            initial_tol, population_size, additional_needed_inds, **common, **kwargs
         )
     elif st == EpsilonSchedulerType.GEOMETRIC_DECAY:
         return GeometricDecayScheduler(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+            initial_tol, population_size, additional_needed_inds, **common, **kwargs
         )
     elif st == EpsilonSchedulerType.ACCEPTANCE_RATE:
         return AcceptanceRateScheduler(
-            initial_tol, population_size, additional_needed_inds, kernel_aware=kernel_aware, **kwargs
+            initial_tol, population_size, additional_needed_inds, **common, **kwargs
         )

@@ -1098,12 +1098,13 @@ class TestAMISBuffer:
 
 
 class TestSchedulerKernelAwareFlag:
-    """Schedulers accept the kernel_aware flag without changing behaviour (for now)."""
+    """Schedulers accept the kernel_aware flag."""
 
     def test_quantile_accepts_kernel_aware(self):
+        # Without kernel_fn the kernel_aware flag has no effect and the
+        # scheduler falls back to the loss-quantile rule.
         sched = QuantileScheduler(10.0, 5, 0, percentile=50.0, kernel_aware=True)
         assert sched.kernel_aware is True
-        # Behaviour identical to kernel_aware=False at present.
         inds = make_inds([0.1, 0.2, 0.3, 0.4, 0.5])
         eps = sched.compute(inds, 10.0)
         assert isinstance(eps, float)
@@ -1113,6 +1114,208 @@ class TestSchedulerKernelAwareFlag:
             "geometric_decay", 10.0, 5, 0, kernel_aware=True, decay_factor=0.9
         )
         assert sched.kernel_aware is True
+
+
+class TestKernelAwareBisection:
+    """Target-ESS bisection for smooth-kernel schedulers (W3.1)."""
+
+    def _gaussian_kernel(self):
+        from propulate.propagators.abcpmc import _GaussianKernel
+
+        return _GaussianKernel()
+
+    def _epanechnikov_kernel(self):
+        from propulate.propagators.abcpmc import _EpanechnikovKernel
+
+        return _EpanechnikovKernel()
+
+    def _converged_archive(self, n: int = 20, scale: float = 0.05):
+        """An archive whose losses are tightly clustered near zero."""
+        rng_np = np.random.default_rng(0)
+        losses = np.abs(rng_np.normal(0.0, scale, size=n))
+        return make_inds(list(map(float, losses)))
+
+    def test_no_kernel_fn_falls_back_to_loss_quantile(self):
+        """kernel_aware=True but kernel_fn=None → original quantile rule fires."""
+        sched = QuantileScheduler(
+            initial_tol=10.0,
+            population_size=5,
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel_aware=True,
+            kernel_fn=None,
+        )
+        inds = make_inds([1.0, 2.0, 3.0, 4.0, 5.0])
+        eps_aware = sched.compute(inds, 10.0)
+        assert eps_aware == pytest.approx(3.0)  # 50th percentile lower-rank
+
+    def test_hard_kernel_falls_back_to_loss_quantile(self):
+        """Hard kernel is degenerate for ESS bisection → original rule fires."""
+        from propulate.propagators.abcpmc import _HardKernel
+
+        sched = QuantileScheduler(
+            initial_tol=10.0,
+            population_size=5,
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel_aware=True,
+            kernel_fn=_HardKernel(),
+        )
+        inds = make_inds([1.0, 2.0, 3.0, 4.0, 5.0])
+        eps_aware = sched.compute(inds, 10.0)
+        assert eps_aware == pytest.approx(3.0)
+
+    def test_bisection_returns_eps_in_box(self):
+        """Bisected ε must lie in [0, current_tol]."""
+        sched = QuantileScheduler(
+            initial_tol=1.0,
+            population_size=5,
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel_aware=True,
+            kernel_fn=self._gaussian_kernel(),
+        )
+        inds = self._converged_archive(n=20, scale=0.05)
+        eps_aware = sched.compute(inds, 1.0)
+        assert 0.0 < eps_aware <= 1.0
+
+    def test_bisection_achieves_target_ess(self):
+        """Relative ESS at the bisected ε should match the target within tolerance."""
+        kfn = self._gaussian_kernel()
+        sched = QuantileScheduler(
+            initial_tol=1.0,
+            population_size=5,
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel_aware=True,
+            kernel_fn=kfn,
+            ess_target=0.8,
+        )
+        inds = self._converged_archive(n=30, scale=0.1)
+        eps_aware = sched.compute(inds, 1.0)
+        # Manually compute relative ESS at the bisected ε.
+        weights = np.ones(len(inds))
+        losses = np.array([ind.loss for ind in inds])
+        rel_ess = sched._relative_ess(weights, losses, kfn, eps_aware)
+        # Bisection tolerance default 1e-4; allow 1e-3 for assertion slack.
+        assert abs(rel_ess - 0.8) < 1e-3 or eps_aware == 1.0
+
+    def test_bisection_lower_target_yields_tighter_eps(self):
+        """Lower ess_target ⇒ bisection accepts a tighter ε."""
+        kfn = self._gaussian_kernel()
+        inds = self._converged_archive(n=30, scale=0.1)
+        eps_high = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.95,
+        ).compute(inds, 1.0)
+        eps_low = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.5,
+        ).compute(inds, 1.0)
+        # ess_target=0.5 is more aggressive ⇒ smaller ε.
+        assert eps_low < eps_high
+
+    def test_bisection_holds_when_too_few_accepted(self):
+        """Not enough accepted inds ⇒ no tightening."""
+        sched = QuantileScheduler(
+            initial_tol=1.0,
+            population_size=10,
+            additional_needed_inds=0,
+            percentile=50.0,
+            kernel_aware=True,
+            kernel_fn=self._gaussian_kernel(),
+        )
+        inds = make_inds([0.1, 0.2, 0.3])  # only 3 < pop=10
+        eps_aware = sched.compute(inds, 1.0)
+        assert eps_aware == pytest.approx(1.0)
+
+    def test_cached_and_uncached_paths_agree(self):
+        """compute_cached and compute must yield the same ε for the same history."""
+        kfn = self._gaussian_kernel()
+        sched_a = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.9,
+        )
+        sched_b = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.9,
+        )
+        inds = self._converged_archive(n=30, scale=0.1)
+        eps_uncached = sched_a.compute(inds, 1.0)
+        # Build the cached views the cached path expects.
+        from sortedcontainers import SortedKeyList
+
+        by_loss = SortedKeyList(inds, key=lambda i: i.loss)
+        by_gen = SortedKeyList(inds, key=lambda i: i.generation)
+        eps_cached = sched_b.compute_cached(inds, 1.0, by_loss, by_gen, by_gen)
+        assert eps_cached == pytest.approx(eps_uncached, rel=1e-9)
+
+    def test_bisection_respects_monotone_guarantee_via_propagator(self):
+        """End-to-end through ABCPMC: child.tolerance ≤ current_tol always."""
+        rng = random.Random(11)
+        abc = ABCPMC(
+            limits=LIMITS, k=5, tol=1.0,
+            scheduler_type="quantile", additional_needed_inds=0, percentile=50.0,
+            kernel="gaussian", rng=rng, ess_target=0.7,
+        )
+        inds = []
+        rng_np = np.random.default_rng(42)
+        prev = float("inf")
+        for i in range(50):
+            child = abc(inds)
+            child.loss = float(rng_np.uniform(0.0, 1.0))
+            child.generation = i
+            inds.append(child)
+            if child.tolerance is not None:
+                assert child.tolerance <= prev + 1e-9
+                prev = child.tolerance
+
+    def test_works_with_geometric_decay_and_acceptance_rate(self):
+        """Bisection dispatch fires on all three scheduler types."""
+        kfn = self._gaussian_kernel()
+        inds = self._converged_archive(n=30, scale=0.1)
+        for st, extra in (
+            ("quantile", {"percentile": 50.0}),
+            ("geometric_decay", {"decay_factor": 0.9}),
+            ("acceptance_rate", {"low_rate": 0.1, "high_rate": 0.3, "shrink_factor": 0.9}),
+        ):
+            sched = create_scheduler(
+                st, 1.0, 5, 0, kernel_aware=True, kernel_fn=kfn, ess_target=0.9, **extra
+            )
+            eps_aware = sched.compute(inds, 1.0)
+            assert 0.0 < eps_aware <= 1.0
+
+    def test_ess_target_invalid_raises(self):
+        with pytest.raises(ValueError, match="ess_target"):
+            QuantileScheduler(1.0, 5, 0, ess_target=0.0)
+        with pytest.raises(ValueError, match="ess_target"):
+            QuantileScheduler(1.0, 5, 0, ess_target=1.5)
+
+    def test_abcpmc_passes_kernel_to_scheduler(self):
+        """ABCPMC must hand its kernel and ess_target to the scheduler factory."""
+        abc = ABCPMC(
+            LIMITS, k=5, tol=1.0,
+            scheduler_type="quantile", additional_needed_inds=0, percentile=50.0,
+            kernel="gaussian", ess_target=0.7,
+        )
+        sched = abc.tolerance_scheduler
+        assert sched.kernel_fn is abc._kernel_fn
+        assert sched.ess_target == pytest.approx(0.7)
+        assert sched._use_kernel_aware() is True
+
+    def test_abcpmc_hard_kernel_disables_bisection(self):
+        abc = ABCPMC(
+            LIMITS, k=5, tol=1.0,
+            scheduler_type="quantile", additional_needed_inds=0, percentile=50.0,
+            kernel="hard",
+        )
+        # Hard kernel: kernel_aware=False at the propagator level so the
+        # scheduler falls back to its loss-quantile rule.
+        assert abc.tolerance_scheduler._use_kernel_aware() is False
+
+    def test_abcpmc_ess_target_invalid_raises(self):
+        with pytest.raises(ValueError, match="ess_target"):
+            ABCPMC(LIMITS, ess_target=0.0)
 
 
 # ===========================================================================
