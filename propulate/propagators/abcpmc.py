@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 from scipy.linalg import solve_triangular
-from scipy.special import logsumexp
+from scipy.special import logsumexp, ndtr
 from sortedcontainers import SortedKeyList
 
 from ..population import Individual
@@ -45,16 +45,6 @@ class _Kernel(ABC):
         """Return K_eps(rho), elementwise."""
         return np.exp(self.log_weight(rho, eps))
 
-    def support_radius(self, eps: float) -> float:
-        """
-        Loss radius beyond which K_eps(rho) is treated as zero.
-
-        Used to size the candidate pool for archive selection. For compactly
-        supported kernels this is the true support boundary; for the Gaussian
-        kernel it is the radius beyond which the weight is below ``1e-12``.
-        """
-        return float("inf")
-
 
 class _HardKernel(_Kernel):
     """K_eps(rho) = 1 if rho < eps else 0 — the classical ABC indicator."""
@@ -65,9 +55,6 @@ class _HardKernel(_Kernel):
         rho = np.asarray(rho, dtype=float)
         out = np.where(rho < eps, 0.0, -np.inf)
         return out
-
-    def support_radius(self, eps: float) -> float:
-        return float(eps)
 
 
 class _GaussianKernel(_Kernel):
@@ -80,10 +67,6 @@ class _GaussianKernel(_Kernel):
         if eps <= 0.0:
             return np.where(rho == 0.0, 0.0, -np.inf)
         return -0.5 * (rho / eps) ** 2
-
-    def support_radius(self, eps: float) -> float:
-        # exp(-x^2/2) < 1e-12 for |x| > ~7.43; pad to 8 sigma.
-        return 8.0 * float(eps)
 
 
 class _EpanechnikovKernel(_Kernel):
@@ -101,9 +84,6 @@ class _EpanechnikovKernel(_Kernel):
         with np.errstate(divide="ignore", invalid="ignore"):
             log_u = np.log(np.where(u > 0.0, u, 1.0))
         return np.where(u > 0.0, log_u, -np.inf)
-
-    def support_radius(self, eps: float) -> float:
-        return float(eps)
 
 
 _KERNEL_REGISTRY = {
@@ -141,28 +121,89 @@ def _log_mixture(weights: np.ndarray, log_pdfs: np.ndarray) -> float:
     return float(logsumexp(log_w + log_pdfs))
 
 
+def _log_box_mass(
+    positions: np.ndarray, sigma: np.ndarray, lo: np.ndarray, hi: np.ndarray
+) -> np.ndarray:
+    """Log of the per-component in-box probability mass ``log Z_j``.
+
+    Candidates are rejection-sampled *inside* the box, so each perturbation
+    component is a Gaussian **truncated** to ``[lo, hi]``. Its true density is the
+    untruncated Gaussian divided by its in-box mass ``Z_j = P(component j ∈ box)``;
+    omitting ``Z_j`` from the importance-sampling denominator inflates the weights
+    of near-boundary particles by ``1 / Z_j``.
+
+    For a component centred at ``positions[j]`` with marginal standard deviations
+    ``sigma`` (shared across components — all share the perturbation covariance),
+
+        log Z_j ≈ Σ_d log( Φ((hi_d - μ_jd)/σ_d) − Φ((lo_d - μ_jd)/σ_d) ).
+
+    This is **exact for a diagonal covariance** and a **diagonal-marginal
+    approximation for a full covariance** (it ignores off-diagonal correlations;
+    a box has no closed-form Gaussian mass under full covariance). Component means
+    lie inside the box, so ``Z_j`` is bounded away from zero and the direct
+    ``ndtr`` difference is numerically safe.
+    """
+    sigma = np.where(sigma > 0.0, sigma, 1.0)  # guard zero-variance dims
+    z_hi = (hi - positions) / sigma  # (k, d)
+    z_lo = (lo - positions) / sigma
+    mass = np.clip(ndtr(z_hi) - ndtr(z_lo), 1e-300, 1.0)  # (k, d)
+    return np.log(mass).sum(axis=1)  # (k,)
+
+
 class _ArchiveSnapshot:
     """Frozen view of the proposal distribution used at one past call.
 
     Stores enough state to evaluate the past proposal density q_tau(theta) at
-    any new theta: archive positions, normalised mixture weights, and the
-    Cholesky factor of the perturbation covariance.
+    any new theta: archive positions, normalised mixture weights, the Cholesky
+    factor of the perturbation covariance, and the precomputed per-component
+    in-box mass ``log Z_j`` (which is independent of the query point, so it is
+    computed once at snapshot creation rather than per candidate).
     """
 
-    __slots__ = ("positions", "weights", "L", "log_norm")
+    __slots__ = ("positions", "weights", "L", "log_norm", "log_box_mass")
 
-    def __init__(self, positions: np.ndarray, weights: np.ndarray, L: np.ndarray) -> None:
+    def __init__(
+        self,
+        positions: np.ndarray,
+        weights: np.ndarray,
+        L: np.ndarray,
+        log_box_mass: np.ndarray,
+    ) -> None:
         self.positions = positions
         self.weights = weights
         self.L = L
+        self.log_box_mass = log_box_mass
         d = positions.shape[1]
         self.log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
 
     def log_pdf(self, theta: np.ndarray) -> np.ndarray:
-        """Log-PDF of each mixture component at theta. Shape: (k,)."""
+        """Log-PDF of each truncated mixture component at theta. Shape: (k,)."""
         diffs = theta - self.positions  # (k, d)
         z = solve_triangular(self.L, diffs.T, lower=True)  # (d, k)
-        return self.log_norm - 0.5 * np.einsum("ij,ij->j", z, z)
+        return self.log_norm - 0.5 * np.einsum("ij,ij->j", z, z) - self.log_box_mass
+
+    def log_mixture_density(self, thetas: np.ndarray) -> np.ndarray:
+        """Log mixture density ``log q(theta)`` for a batch of points.
+
+        Vectorised over a ``(n, d)`` batch, returning ``(n,)``. All components
+        share the covariance ``L Lᵀ``, so the Mahalanobis distance equals the
+        Euclidean distance after whitening — whiten once and form pairwise
+        squared distances, rather than a triangular solve per (point, component).
+        Used by :meth:`ABCPMC.extract_posterior` for the retroactive reweighting.
+        """
+        theta_w = solve_triangular(self.L, thetas.T, lower=True).T  # (n, d)
+        mu_w = solve_triangular(self.L, self.positions.T, lower=True).T  # (k, d)
+        sq = (
+            (theta_w ** 2).sum(1)[:, None]
+            + (mu_w ** 2).sum(1)[None, :]
+            - 2.0 * theta_w @ mu_w.T
+        )  # (n, k) squared Mahalanobis distances
+        log_pdfs = self.log_norm - 0.5 * sq - self.log_box_mass[None, :]  # (n, k)
+        with np.errstate(divide="ignore"):
+            log_w = np.where(
+                self.weights > 0.0, np.log(np.where(self.weights > 0.0, self.weights, 1.0)), -np.inf
+            )
+        return logsumexp(log_pdfs + log_w[None, :], axis=1)  # (n,)
 
 
 class _IncrementalCache:
@@ -185,6 +226,7 @@ class _IncrementalCache:
         "_by_gen",
         "_accepted_by_gen",
         "_initial_tol",
+        "_last_ind",
     )
 
     def __init__(self, initial_tol: float) -> None:
@@ -194,6 +236,10 @@ class _IncrementalCache:
         self._by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
         self._accepted_by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
         self._initial_tol: float = initial_tol
+        # Identity of the last individual processed, used to verify that the
+        # previously-cached prefix is still intact before taking the
+        # append-only fast path (see ABCPMC._update_cache).
+        self._last_ind = None
 
     # -- full rebuild (fallback) -----------------------------------------------
 
@@ -216,6 +262,8 @@ class _IncrementalCache:
         acc_gen = [ind for ind in inds if ind.loss < initial_tol]
         self._accepted_by_gen = SortedKeyList(acc_gen, key=lambda ind: ind.generation)
 
+        self._last_ind = inds[-1] if inds else None
+
     # -- incremental update ----------------------------------------------------
 
     def update(self, new_ind) -> None:
@@ -234,6 +282,8 @@ class _IncrementalCache:
         # Insert into accepted-by-generation (for GeometricDecayScheduler)
         if new_ind.loss < self._initial_tol:
             self._accepted_by_gen.add(new_ind)
+
+        self._last_ind = new_ind
 
     # -- query methods ---------------------------------------------------------
 
@@ -257,12 +307,26 @@ class ABCPMC(Propagator):
     Steady-state asynchronous ABC-PMC propagator with configurable likelihood
     kernel and optional streaming-AMIS reweighting.
 
-    The algorithm is fully stateless w.r.t. its algorithmic state: the
-    effective bandwidth and the active archive are reconstructed from the
-    evaluated-history list ``inds`` passed to ``__call__`` on every
-    invocation. Internal caches and the AMIS snapshot ring buffer are
-    *performance* state — they do not change the result for valid inputs.
-    ``inds`` must be append-only between calls.
+    Statelessness and the posterior estimator
+    -----------------------------------------
+    The algorithm is stateless w.r.t. its algorithmic state: the effective
+    bandwidth and the active archive are reconstructed from the evaluated-history
+    list ``inds`` on every ``__call__``. The posterior the paper reports is
+    :meth:`extract_posterior`, which is a **pure function of the history** — it
+    replays the proposal sequence deterministically — so it is identical whether
+    computed in one run or after a crash/restart with an empty buffer. That is
+    what makes "stateless / crash-recoverable" hold for the *estimator*, not just
+    the archive.
+
+    The per-call ``Individual.weight`` and the AMIS snapshot ring buffer are
+    **proposal-side performance state**: the stored weight steers parent
+    selection and the buffer supplies the proposal-time importance denominator,
+    but neither feeds :meth:`extract_posterior`, so a stale or empty buffer
+    changes only proposal quality, never the reported posterior. The buffer is
+    cleared on a genuine history rollback (shrink or non-append-only mutation
+    under island migration) so a rolled-back future cannot leak forward. ``inds``
+    is append-only in single-island runs; under migration the cache detects the
+    non-append-only case and rebuilds.
 
     Kernel modes
     ------------
@@ -286,36 +350,40 @@ class ABCPMC(Propagator):
       supported smooth kernel; particles with ``rho > eps`` contribute zero.
 
     For smooth kernels (``"gaussian"`` / ``"epanechnikov"``) the bandwidth
-    ``eps`` is selected by the scheduler in its *kernel-aware* mode (when
-    ``kernel_aware=True`` and an ESS-bisection rule is implemented). The
-    current schedulers accept and store the flag but use the loss-quantile
-    / acceptance-rate / geometric-decay rule regardless; target-ESS
-    bisection (Del Moral, Doucet & Jasra 2012) is wired up in W3.1 of the
-    asynchronous-ABC paper plan.
+    ``eps`` is selected by the scheduler in its *kernel-aware* mode, which is
+    active by default for smooth kernels (``kernel_aware`` is set from the
+    kernel choice). The scheduler chooses ``eps`` by bisection on the
+    kernel-weighted effective sample size, targeting a fixed per-step ESS
+    retention ratio (the Del Moral, Doucet & Jasra 2012 successive-population
+    rule), subject to the monotone-decrease guarantee. The hard kernel
+    retains the loss-quantile / acceptance-rate / geometric-decay rule.
 
     AMIS reweighting
     ----------------
-    When ``amis_snapshots > 0``, the propagator maintains a ring buffer of
-    past proposal distributions. New particles' importance weights use the
-    balance-heuristic denominator
+    Two distinct weightings live here; keep them separate:
 
-        q_bar_n(theta) = (1 / S) * sum_s q_s(theta)
+    - The *proposal-time* weight stored on each ``Individual`` is the core
+      importance weight ``pi(theta) / q_bar_tau(theta)`` measured against the
+      balance-heuristic denominator at proposal time, where (when
+      ``amis_snapshots > 0``) ``q_bar`` averages the current proposal with a ring
+      buffer of past proposal snapshots (the streaming variant of Cornuet et al.
+      2012's AMIS scheme). This weight only steers parent selection and the next
+      proposal covariance; ``amis_snapshots=0`` recovers the single-current-
+      proposal weighting.
+    - The *reported posterior* is :meth:`extract_posterior`, which applies the
+      **retroactive** balance heuristic: every particle is reweighted against the
+      cumulative proposal mixture reconstructed at the END of the run (evaluated
+      at every past particle), times the kernel factor ``K_{eps}(rho)``. This is
+      the estimator the consistency + CLT are stated for; the frozen proposal-time
+      weight is not.
 
-    over snapshots s, in addition to the current proposal. This is the
-    streaming variant of Cornuet et al. 2012's AMIS scheme and gives a
-    coherent reweighting against the cumulative proposal mixture rather than
-    the moment-of-arrival proposal. Set ``amis_snapshots=0`` for the legacy
-    single-current-proposal weighting.
-
-    Stored ``Individual`` weights are the *core* importance weights
-    ``pi(theta) / denom(theta)`` measured at proposal time; the kernel
-    factor ``K_eps(rho)`` is applied separately at use time, so changes to
-    eps automatically reweight the archive without re-evaluating the
-    simulator.
+    The kernel factor ``K_eps(rho)`` is applied at use time, so changing eps
+    reweights the archive without re-evaluating the simulator.
 
     See Also
     --------
     :class:`Propagator` : The parent class.
+    :meth:`extract_posterior` : The retroactive AMIS posterior estimator.
     """
 
     _MAX_RESAMPLE_ATTEMPTS = 1000
@@ -346,7 +414,13 @@ class ABCPMC(Propagator):
         limits : Dict
             Search-space limits for each gene (float intervals only).
         perturbation_scale : float
-            Scale factor for the perturbation covariance.
+            Scale factor applied to the weighted archive covariance to form
+            the perturbation kernel covariance. PMC optimality (Beaumont et
+            al. 2009; Filippi et al. 2013) corresponds to roughly twice the
+            weighted covariance (``perturbation_scale ≈ 2.0``); the default
+            ``0.8`` is deliberately narrower (best-fit / optimisation-leaning
+            behaviour) and under-explores the tails for posterior
+            approximation. Sweep this for posterior-quality work.
         k : int
             Archive size: number of accepted individuals used to build the
             mixture proposal.
@@ -369,21 +443,25 @@ class ABCPMC(Propagator):
             ``'gaussian'`` (smooth, recommended), ``'epanechnikov'``
             (compactly supported). Default ``'hard'`` for back-compat.
         amis_snapshots : int
-            Number of past proposal snapshots to retain for streaming-AMIS
-            balance-heuristic reweighting (Cornuet et al. 2012). Default
-            ``20``. Set to ``0`` to opt into the legacy single-current-proposal
-            weighting (not recommended; the cumulative-mixture denominator
-            is what the asynchronous-ABC consistency argument relies on).
+            Number of past proposal snapshots retained for the streaming-AMIS
+            balance-heuristic denominator used at *proposal time* (Cornuet et al.
+            2012), and the default number of proposals
+            :meth:`extract_posterior` reconstructs for the *reported* posterior.
+            Default ``20``. Set to ``0`` for the legacy single-current-proposal
+            proposal-time weighting (this does not affect
+            :meth:`extract_posterior`, which always reconstructs the cumulative
+            mixture from history).
         amis_interval : int, optional
             Number of ``__call__`` invocations between snapshots. Defaults
             to ``k`` so each snapshot represents one archive turnover.
         ess_target : float
-            Target relative ESS for the kernel-aware bandwidth bisection
-            (Del Moral, Doucet & Jasra 2012). Active only when ``kernel``
-            is a smooth kernel (``"gaussian"`` or ``"epanechnikov"``);
-            ignored for the hard kernel which retains the loss-quantile /
-            acceptance-rate / geometric-decay schedule.  Must lie in
-            ``(0, 1]``; default ``0.95``.
+            Per-step ESS *retention ratio* for the kernel-aware bandwidth
+            bisection (Del Moral, Doucet & Jasra 2012): each tightening step
+            picks ε so that ``ESS(ε) ≈ ess_target · ESS(current_tol)``. Active
+            only when ``kernel`` is a smooth kernel (``"gaussian"`` or
+            ``"epanechnikov"``); ignored for the hard kernel which retains the
+            loss-quantile / acceptance-rate / geometric-decay schedule. Must
+            lie in ``(0, 1]``; default ``0.95`` (retain 95% of ESS per step).
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -426,6 +504,9 @@ class ABCPMC(Propagator):
             raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
+        # Constant box bounds, used by the proposal build and box-mass correction.
+        self._lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
+        self._hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
         self._cache = _IncrementalCache(self.tol)
 
         # AMIS snapshot ring buffer (performance state, not algorithmic state).
@@ -441,18 +522,46 @@ class ABCPMC(Propagator):
         self._warned_zero_weight: bool = False
 
     def _update_cache(self, inds: List[Individual]) -> None:
-        """Incrementally update the internal performance cache."""
+        """Incrementally update the internal performance cache.
+
+        The append-only fast path is valid only when the previously-cached
+        prefix is still intact. The propagator receives the *active* subset of
+        the population, which is **not** append-only under the island model:
+        migration deactivates emigrants, removing them from arbitrary positions
+        in the active list while new arrivals are appended at the end. The old
+        prefix is intact iff the element now at index ``cached_len - 1`` is still
+        the last individual the cache processed — any deactivation inside the
+        prefix shifts or drops it, changing that identity. This O(1) check also
+        catches the equal-length content-change case (one emigrant deactivated +
+        one immigrant appended), which a length-only test would silently miss.
+        On any mismatch (or a shrink) we rebuild; this fires only on migration
+        calls, never on the append-only steady state.
+        """
         n = len(inds)
         cached_len = self._cache.history_len
-        if cached_len < 0 or n < cached_len:
-            # First call or history shrunk — full rebuild
+        prefix_intact = (
+            cached_len >= 1
+            and n >= cached_len
+            and inds[cached_len - 1] is self._cache._last_ind
+        )
+        if cached_len < 0 or n < cached_len or not prefix_intact:
+            # First call, history shrunk, or non-append-only mutation — rebuild.
+            if cached_len >= 0:
+                # A genuine rollback (shrink or content change), not the initial
+                # build. The AMIS snapshot buffer is a proposal-side performance
+                # cache; drop it so snapshots taken in a now-rolled-back future
+                # cannot leak into subsequent proposal denominators. (The
+                # posterior estimator does not depend on the buffer — see
+                # extract_posterior — so this only affects proposal quality.)
+                self._snapshots.clear()
+                self._calls_since_snapshot = 0
             self._cache.rebuild(inds, self.tol)
             self.tolerance_scheduler.reset_cache()
         elif n > cached_len:
-            # New individuals — process incrementally
+            # Pure append — process the new tail incrementally.
             for new_ind in inds[cached_len:]:
                 self._cache.update(new_ind)
-        # n == cached_len: no change, use cached state as-is
+        # n == cached_len and prefix intact: genuinely no change.
 
     def filter_by_tolerance(self, inds: List[Individual], tol: float) -> List[Individual]:
         """
@@ -530,6 +639,78 @@ class ABCPMC(Propagator):
         wd = weights[:, None] * diffs
         cov = wd.T @ diffs
         return factor * cov
+
+    def _build_proposal(self, archive: List[Individual], effective_tol: float):
+        """Build the truncated Gaussian-mixture proposal density from an archive.
+
+        Pure function of ``(archive, effective_tol)``. Shared by :meth:`__call__`
+        (the live proposal) and :meth:`extract_posterior` (history replay) so the
+        reconstructed proposal sequence matches the one actually used. Computes the
+        effective mixture weights ``∝ stored_weight · K_eps(loss)`` in log-space,
+        the perturbation Cholesky factor, and the per-component in-box mass.
+
+        Returns
+        -------
+        positions : np.ndarray, shape (k, d)
+        weights : np.ndarray, shape (k,)
+            Normalised mixture weights.
+        L : np.ndarray, shape (d, d)
+            Cholesky factor of the perturbation covariance.
+        log_box_mass : np.ndarray, shape (k,)
+            Per-component ``log Z_j`` truncation constant.
+        """
+        if any(ind.weight is None for ind in archive):
+            if not self._warned_none:
+                logger.warning(
+                    "ABCPMC: one or more archive individuals have weight=None "
+                    "(likely from an external propagator). Falling back to weight=1.0 "
+                    "for those individuals; importance weights will be approximate."
+                )
+                self._warned_none = True
+        raw = np.fromiter(
+            (1.0 if ind.weight is None else max(float(ind.weight), 0.0) for ind in archive),
+            dtype=float,
+            count=len(archive),
+        )
+        losses_arr = np.fromiter(
+            (float(ind.loss) for ind in archive), dtype=float, count=len(archive)
+        )
+        log_kernel = self._kernel_fn.log_weight(losses_arr, effective_tol)
+        with np.errstate(divide="ignore"):
+            log_raw = np.where(raw > 0.0, np.log(np.where(raw > 0.0, raw, 1.0)), -np.inf)
+        log_effective = log_raw + log_kernel
+
+        finite_mask = np.isfinite(log_effective)
+        if not finite_mask.any():
+            # All archive members have zero smooth weight (e.g. Epanechnikov
+            # support too tight). Fall back to uniform mixture weights so the
+            # algorithm continues to make progress.
+            weights = np.full(len(archive), 1.0 / len(archive))
+        else:
+            log_eff_max = float(np.max(log_effective[finite_mask]))
+            shifted = np.where(finite_mask, log_effective - log_eff_max, -np.inf)
+            weights = np.exp(shifted)
+            wsum = weights.sum()
+            if wsum <= 0.0:
+                weights = np.full(len(archive), 1.0 / len(archive))
+            else:
+                weights = weights / wsum
+
+        positions = np.stack([ind.position for ind in archive])
+        cov = self.weighted_covariance(positions, weights)
+        cov += 1e-6 * np.eye(positions.shape[1])
+        kernel_cov = self.perturbation_scale * cov
+        kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
+        try:
+            L = np.linalg.cholesky(kernel_cov)
+        except np.linalg.LinAlgError:
+            kernel_cov += 1e-7 * np.eye(positions.shape[1])
+            L = np.linalg.cholesky(kernel_cov)
+        # Per-component in-box mass log Z_j (candidate-independent; computed once
+        # per proposal, never per candidate — see _log_box_mass).
+        sigma = np.sqrt(np.diag(kernel_cov))
+        log_box_mass = _log_box_mass(positions, sigma, self._lo, self._hi)
+        return positions, weights, L, log_box_mass
 
     def __call__(self, inds: List[Individual]) -> Individual:
         """
@@ -616,56 +797,11 @@ class ABCPMC(Propagator):
             child.weight = 1.0
             return child
 
-        # 6. Compute effective archive weights = stored_weight * K_eps(loss).
-        #    Done in log-space for numerical stability (Gaussian kernel
-        #    weights can span many orders of magnitude).
-        if any(ind.weight is None for ind in archive):
-            if not self._warned_none:
-                logger.warning(
-                    "ABCPMC: one or more archive individuals have weight=None "
-                    "(likely from an external propagator). Falling back to weight=1.0 "
-                    "for those individuals; importance weights will be approximate."
-                )
-                self._warned_none = True
-        raw = np.fromiter(
-            (1.0 if ind.weight is None else max(float(ind.weight), 0.0) for ind in archive),
-            dtype=float,
-            count=len(archive),
-        )
-        losses_arr = np.fromiter(
-            (float(ind.loss) for ind in archive), dtype=float, count=len(archive)
-        )
-        log_kernel = self._kernel_fn.log_weight(losses_arr, effective_tol)
-        with np.errstate(divide="ignore"):
-            log_raw = np.where(raw > 0.0, np.log(np.where(raw > 0.0, raw, 1.0)), -np.inf)
-        log_effective = log_raw + log_kernel
-
-        finite_mask = np.isfinite(log_effective)
-        if not finite_mask.any():
-            # All archive members have zero smooth weight (e.g. Epanechnikov
-            # support too tight). Fall back to uniform mixture weights so the
-            # algorithm continues to make progress.
-            weights = np.full(len(archive), 1.0 / len(archive))
-        else:
-            log_eff_max = float(np.max(log_effective[finite_mask]))
-            shifted = np.where(finite_mask, log_effective - log_eff_max, -np.inf)
-            weights = np.exp(shifted)
-            wsum = weights.sum()
-            if wsum <= 0.0:
-                weights = np.full(len(archive), 1.0 / len(archive))
-            else:
-                weights = weights / wsum
-
-        positions = np.stack([ind.position for ind in archive])
-        cov = self.weighted_covariance(positions, weights)
-        cov += 1e-6 * np.eye(positions.shape[1])
-        kernel_cov = self.perturbation_scale * cov
-        kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
-        try:
-            L = np.linalg.cholesky(kernel_cov)
-        except np.linalg.LinAlgError:
-            kernel_cov += 1e-7 * np.eye(positions.shape[1])
-            L = np.linalg.cholesky(kernel_cov)
+        # 6+7. Build the truncated Gaussian-mixture proposal from the archive
+        #      (effective weights, perturbation Cholesky, per-component in-box
+        #      mass). Shared with extract_posterior so the reconstructed proposal
+        #      sequence matches the one used live.
+        positions, weights, L, log_box_mass = self._build_proposal(archive, effective_tol)
 
         # 7+8. Sample candidate and assign its importance weight.
         #
@@ -675,8 +811,8 @@ class ABCPMC(Propagator):
         # produced outlier weights ~prior/1e-12 capable of swamping the
         # mixture). On final exhaustion the candidate keeps weight = 0,
         # which drops out of weighted_covariance and resampling.
-        lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
-        hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
+        lo = self._lo
+        hi = self._hi
         d = positions.shape[1]
         BATCH = 16
         log_min = np.log(self._MIN_DENOM)
@@ -722,7 +858,7 @@ class ABCPMC(Propagator):
             diffs = candidate_pos - positions
             z_solve = solve_triangular(L, diffs.T, lower=True)
             log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
-            log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve)
+            log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve) - log_box_mass
             log_current = _log_mixture(weights, log_pdfs)
 
             if self._amis_snapshots > 0 and len(self._snapshots) > 0:
@@ -763,15 +899,150 @@ class ABCPMC(Propagator):
                 self._warned_zero_weight = True
             child.weight = 0.0
 
-        # 9. Snapshot the current proposal for future AMIS denominators.
+        # 9. Snapshot the current proposal for future AMIS denominators. The
+        #    per-component in-box mass is the same one used for this call's
+        #    denominator, so it is reused rather than recomputed.
         self._calls_since_snapshot += 1
         if self._amis_snapshots > 0 and self._calls_since_snapshot >= self._amis_interval:
             self._snapshots.append(
-                _ArchiveSnapshot(positions.copy(), weights.copy(), L.copy())
+                _ArchiveSnapshot(
+                    positions.copy(), weights.copy(), L.copy(), log_box_mass.copy()
+                )
             )
             self._calls_since_snapshot = 0
 
         return child
+
+    def _reconstruct_archive(
+        self, prefix: List[Individual], eps: float
+    ) -> Optional[List[Individual]]:
+        """Reconstruct the top-k archive a call would have selected on *prefix*.
+
+        Mirrors :meth:`select_archive` / the cache's ``get_archive``: hard kernel
+        keeps the top-k by loss among ``loss < eps``; smooth kernels keep the
+        top-k by loss overall. Returns ``None`` if fewer than ``k`` candidates
+        exist (the call would still have been in the bootstrap phase).
+        """
+        if self.kernel_name == "hard":
+            accepted = [ind for ind in prefix if ind.loss < eps]
+            archive = sorted(accepted, key=lambda i: i.loss)[: self.k]
+        else:
+            archive = sorted(prefix, key=lambda i: i.loss)[: self.k]
+        if len(archive) < self.k:
+            return None
+        return archive
+
+    def extract_posterior(
+        self,
+        inds: List[Individual],
+        *,
+        eps_final: Optional[float] = None,
+        n_proposals: Optional[int] = None,
+    ):
+        """Retroactive AMIS posterior estimate from the evaluated history.
+
+        This is the estimator the consistency + CLT are stated for. Every
+        particle is reweighted against the **current cumulative proposal
+        mixture** (the balance heuristic of Cornuet et al. 2012), not against the
+        proposal-time mixture frozen onto it during the run. The per-call
+        ``Individual.weight`` is only a proposal-selection device; the posterior
+        the paper reports is this quantity.
+
+        It is a **pure function of** ``inds`` — the proposal sequence is replayed
+        deterministically from history — so the result is identical whether
+        computed in a single run or after a crash/restart with an empty snapshot
+        buffer. That is what makes "stateless / crash-recoverable" hold for the
+        estimator (not merely the archive).
+
+        Runs in the analysis phase (once per run, cost ``O(n · n_proposals · k)``);
+        **never call it inside the timed inference loop** — it is deliberately off
+        the per-``__call__`` hot path.
+
+        Parameters
+        ----------
+        inds : List[Individual]
+            Full evaluated history.
+        eps_final : float, optional
+            Bandwidth at which to report the posterior. Defaults to the tightest
+            bandwidth reached over the history (the running minimum of the
+            stamped tolerances).
+        n_proposals : int, optional
+            Number of past proposals to reconstruct for the cumulative-mixture
+            denominator. Defaults to ``amis_snapshots`` — the fixed-S balance
+            heuristic, i.e. the (C4) approximation to the full cumulative mixture.
+
+        Returns
+        -------
+        positions : np.ndarray, shape (n, d)
+            Particle positions in history order.
+        weights : np.ndarray, shape (n,)
+            Self-normalised importance weights
+            ``w_i ∝ π(θ_i) · K_{ε_final}(ρ_i) / q̄(θ_i)`` summing to 1.
+        """
+        n = len(inds)
+        d = len(self.limits)
+        if n == 0:
+            return np.empty((0, d)), np.empty(0)
+
+        positions = np.stack([ind.position for ind in inds])  # (n, d)
+        losses = np.array([float(ind.loss) for ind in inds])
+
+        tols = [ind.tolerance for ind in inds if ind.tolerance is not None]
+        if eps_final is None:
+            eps_final = min(tols) if tols else self.tol
+
+        # Archive-phase calls: those whose proposal stamped a tolerance. Bootstrap
+        # (uniform-prior) draws have tolerance is None.
+        archive_idx = [i for i, ind in enumerate(inds) if ind.tolerance is not None]
+        if not archive_idx:
+            # Never left the bootstrap phase: every draw is a uniform-prior draw,
+            # so the posterior is the (flat) prior — equal weights.
+            return positions, np.full(n, 1.0 / n)
+
+        if n_proposals is None:
+            n_proposals = self._amis_snapshots if self._amis_snapshots > 0 else 1
+        n_proposals = max(1, min(n_proposals, len(archive_idx)))
+        step = max(1, len(archive_idx) // n_proposals)
+        picks = list(archive_idx[::step][:n_proposals])
+        if archive_idx[-1] not in picks:
+            picks.append(archive_idx[-1])
+
+        # Reconstruct each chosen past proposal q_tau from the history prefix the
+        # call saw (inds[:tau]) at the bandwidth it stamped (inds[tau].tolerance),
+        # reusing the live proposal builder so the reconstruction is faithful.
+        snapshots = []
+        for tau in picks:
+            eps_tau = inds[tau].tolerance
+            archive = self._reconstruct_archive(inds[:tau], eps_tau)
+            if archive is None:
+                continue
+            pos, w, L, lbm = self._build_proposal(archive, eps_tau)
+            snapshots.append(_ArchiveSnapshot(pos, w, L, lbm))
+
+        if not snapshots:
+            return positions, np.full(n, 1.0 / n)
+
+        # Cumulative proposal mixture q̄, evaluated at EVERY particle (the
+        # retroactive step). A uniform-prior component covers the bootstrap draws
+        # and keeps q̄ strictly positive on the whole box (bounded weights).
+        m = len(snapshots)
+        log_prior = float(np.log(self.prior_density))
+        log_components = np.empty((m + 1, n))
+        for s, snap in enumerate(snapshots):
+            log_components[s] = snap.log_mixture_density(positions)
+        log_components[m] = log_prior
+        log_qbar = logsumexp(log_components, axis=0) - np.log(m + 1)
+
+        log_kernel = self._kernel_fn.log_weight(losses, eps_final)
+        log_w = log_prior + log_kernel - log_qbar
+        finite = np.isfinite(log_w)
+        if not finite.any():
+            return positions, np.full(n, 1.0 / n)
+        log_w = np.where(finite, log_w - np.max(log_w[finite]), -np.inf)
+        weights = np.where(finite, np.exp(log_w), 0.0)
+        total = weights.sum()
+        weights = weights / total if total > 0 else np.full(n, 1.0 / n)
+        return positions, weights
 
 
 class EpsilonScheduler(ABC):
@@ -789,16 +1060,20 @@ class EpsilonScheduler(ABC):
     Kernel-aware mode
     -----------------
     When ``kernel_aware=True`` and a smooth kernel function is supplied, the
-    scheduler selects ε by bisection on the **relative kernel-weighted ESS**
-    rather than from raw loss statistics. The target ratio ``ess_target``
-    (default 0.95) controls how aggressive the tightening is: at each call
-    the scheduler proposes the largest ε ≤ ``current_tol`` such that
+    scheduler selects ε by bisection on the kernel-weighted effective sample
+    size rather than from raw loss statistics. ``ess_target`` (default 0.95)
+    is the **per-step ESS retention ratio**: at each call the scheduler
+    proposes the largest ε ≤ ``current_tol`` such that
 
-        ESS(ε) / N ≈ ess_target,                ESS(ε) = (Σ w·K_ε)² / Σ(w·K_ε)²
+        ESS(ε) ≈ ess_target · ESS(current_tol),   ESS(ε) = (Σ w·K_ε)² / Σ(w·K_ε)²
 
     where ``w`` is the stored core importance weight and ``K_ε(ρ)`` is the
-    smooth ABC kernel. This is the Del Moral, Doucet & Jasra 2012 adaptive
-    bandwidth rule restricted to smooth-kernel ABC.
+    smooth ABC kernel. This is the Del Moral, Doucet & Jasra 2012
+    successive-population rule (tighten so each population retains a fixed
+    fraction of the previous ESS) restricted to smooth-kernel ABC. Targeting a
+    *ratio* of the current ESS — rather than an absolute ``ESS/N`` floor —
+    guarantees a tightening direction always exists, so the bandwidth keeps
+    sharpening instead of stalling once the absolute ESS drops below the floor.
 
     For the hard kernel or ``kernel_aware=False`` the schedulers retain
     their original loss-quantile / acceptance-rate / geometric-decay
@@ -867,44 +1142,57 @@ class EpsilonScheduler(ABC):
     def _bisect_target_ess(
         self, weights: np.ndarray, losses: np.ndarray, current_tol: float
     ) -> float:
-        """Return the largest ε ∈ [0, current_tol] with relative ESS ≈ target.
+        """Return the largest ε ≤ current_tol retaining a fixed fraction of the ESS.
 
-        If the relative ESS at ``current_tol`` is already below the target
-        (e.g. the kernel mixture is already concentrated), no tightening is
-        possible — return ``current_tol``. Otherwise bisect.
+        This is the Del Moral, Doucet & Jasra 2012 *successive-population* rule:
+        pick ε_new so that ``ESS(w·K_{ε_new}) = α · ESS(w·K_{ε_current})`` with
+        ``α = ess_target`` (default 0.95), i.e. each step retains a fixed
+        fraction of the current effective sample size.
+
+        ESS is monotone increasing in ε — a looser bandwidth flattens the kernel
+        weights toward the core weights, a tighter one concentrates them on the
+        lowest-loss particles. Because ``α < 1`` the goal ESS is always strictly
+        below ``ESS(current_tol)``, so a tightening ε always exists. This is the
+        key difference from an *absolute* ESS target (``ESS/N ≈ 0.95``), which
+        stalls permanently for smooth kernels whose ESS at the loose bandwidth is
+        already below the absolute floor — leaving the bandwidth frozen and the
+        posterior unable to sharpen.
+
+        The ``/N`` in :meth:`_relative_ess` cancels in the ratio, so the relative
+        form is used throughout.
         """
         kfn = self.kernel_fn
         assert kfn is not None  # guarded by _use_kernel_aware
         if current_tol <= 0.0 or weights.size == 0:
             return current_tol
 
-        target = self.ess_target
-        ess_high = self._relative_ess(weights, losses, kfn, current_tol)
-        if ess_high <= target + self._BISECT_TOL:
-            # Already at or below target — bisection would only loosen ε.
+        ess_current = self._relative_ess(weights, losses, kfn, current_tol)
+        if ess_current <= 0.0:
+            # Degenerate: no effective weight at current_tol (e.g. all archive
+            # members already outside a compact kernel's support). Nothing to do.
             return current_tol
+        ess_goal = self.ess_target * ess_current
 
         # Lower bound: positive, well below current_tol. Use 1e-6 * current_tol
         # rather than 0 so the kernel-weight evaluation stays in the smooth
         # regime even for the Gaussian kernel.
         low = max(1e-12, 1e-6 * current_tol)
         high = current_tol
-        # If even the lower bound is above target, target is unreachable
-        # without going lower than `low`; clip to `low`.
-        ess_low = self._relative_ess(weights, losses, kfn, low)
-        if ess_low >= target:
+        # If even the tightest ε retains more ESS than the goal, the goal is
+        # unreachable above `low`; clip to `low` (maximal tightening).
+        if self._relative_ess(weights, losses, kfn, low) >= ess_goal:
             return low
 
         for _ in range(self._BISECT_ITERATIONS):
             mid = 0.5 * (low + high)
             ess_mid = self._relative_ess(weights, losses, kfn, mid)
-            if abs(ess_mid - target) <= self._BISECT_TOL:
+            if abs(ess_mid - ess_goal) <= self._BISECT_TOL:
                 return mid
-            if ess_mid > target:
-                # ε too lax for target — tighten.
+            if ess_mid > ess_goal:
+                # ε too loose — too much ESS retained; tighten.
                 high = mid
             else:
-                # ε too tight — relax.
+                # ε too tight — too little ESS retained; relax.
                 low = mid
         return 0.5 * (low + high)
 

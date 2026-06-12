@@ -771,6 +771,60 @@ class TestCacheInvalidation:
         assert abc._cache.n_accepted == 3
         assert abc._cache.tol_from_history == 4.0
 
+    def test_equal_length_content_change_triggers_rebuild(self):
+        """Island model (R6): an active set that changes content without
+        changing length (one emigrant deactivated + one immigrant appended)
+        must not be served from a stale cache. A length-only check would miss
+        this; the tail-identity check catches it and rebuilds."""
+        abc = ABCPMC(LIMITS, k=3, tol=20.0)
+        a, b, c, d = [make_ind(loss=float(i + 1), tolerance=5.0, generation=i)
+                      for i in range(4)]
+        e = make_ind(loss=2.5, tolerance=2.0, generation=4)  # holds the running-min tol
+        history = [a, b, c, d, e]
+        abc(inds=history)
+        assert abc._cache.history_len == 5
+        assert abc._cache.tol_from_history == 2.0  # from e
+
+        # Migration: e emigrates (removed), immigrant f arrives (appended).
+        # Length is unchanged (5), but the last element is now f, not e.
+        f = make_ind(loss=2.5, tolerance=5.0, generation=5)
+        swapped = [a, b, c, d, f]
+        abc(inds=swapped)
+        assert abc._cache._last_ind is f
+        # A stale (no-op) cache would keep tol_from_history == 2.0 (e's value);
+        # the running min only ever decreases on the incremental path. A rebuild
+        # recomputes it from the new content → 5.0, proving the rebuild fired.
+        assert abc._cache.tol_from_history == 5.0
+
+    def test_append_only_does_not_rebuild(self):
+        """R6 perf guard: pure-append growth must stay on the incremental path
+        (no rebuild), so the island-model fix doesn't regress steady-state cost."""
+        abc = ABCPMC(LIMITS, k=3, tol=20.0)
+        history = [make_ind(loss=float(i + 1), tolerance=5.0, generation=i)
+                   for i in range(4)]
+        abc(inds=history)  # first call rebuilds (cached_len < 0)
+
+        sched = abc.tolerance_scheduler
+        rebuilds = {"n": 0}
+        orig_reset = sched.reset_cache  # reset_cache is called only on the rebuild branch
+
+        def counting_reset():
+            rebuilds["n"] += 1
+            orig_reset()
+
+        sched.reset_cache = counting_reset
+
+        # Append-only growth: no rebuild expected.
+        for i in range(4, 9):
+            history.append(make_ind(loss=float(i + 1), tolerance=5.0, generation=i))
+            abc(inds=history)
+        assert rebuilds["n"] == 0
+
+        # Replace the last element (same length, different object) → one rebuild.
+        history[-1] = make_ind(loss=2.5, tolerance=5.0, generation=99)
+        abc(inds=history)
+        assert rebuilds["n"] == 1
+
 
 class TestPerformanceRegression:
     """Verify that __call__ time does not grow quadratically with history size."""
@@ -920,12 +974,6 @@ class TestKernels:
             assert np.allclose(np.exp(lw[nz]), w[nz])
             # Zero w corresponds to -inf log weight.
             assert np.all(np.isneginf(lw[~nz])) if (~nz).any() else True
-
-    def test_support_radius(self):
-        assert _HardKernel().support_radius(2.0) == 2.0
-        assert _EpanechnikovKernel().support_radius(2.0) == 2.0
-        # Gaussian: 8 sigma, well beyond 1e-12 cutoff.
-        assert _GaussianKernel().support_radius(2.0) > 2.0
 
     def test_make_kernel_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown ABCPMC kernel"):
@@ -1215,6 +1263,30 @@ class TestKernelAwareBisection:
         # ess_target=0.5 is more aggressive ⇒ smaller ε.
         assert eps_low < eps_high
 
+    def test_skewed_core_weights_still_tighten(self):
+        """Regression (R3): with dispersed core weights the kernel-weighted ESS
+        at the loose bandwidth is already far below any absolute floor — exactly
+        the condition under which the old absolute-ESS rule stalled (returned
+        current_tol unchanged, freezing the bandwidth). The DMDJ successive-ratio
+        rule must still produce a strictly tighter ε."""
+        kfn = self._gaussian_kernel()
+        sched = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0,
+            percentile=50.0, kernel_aware=True, kernel_fn=kfn, ess_target=0.95,
+        )
+        rng = np.random.default_rng(0)
+        n = 40
+        weights = np.ones(n)
+        weights[0] = 1000.0  # heavily dispersed core weights → low ESS
+        losses = np.abs(rng.normal(0.0, 0.05, size=n))
+        current_tol = 1.0
+        ess_current = sched._relative_ess(weights, losses, kfn, current_tol)
+        assert ess_current < 0.95  # the exact stall condition for the old rule
+        eps_new = sched._bisect_target_ess(weights, losses, current_tol)
+        assert eps_new < current_tol  # ratio rule still tightens — no stall
+        # Tightening never increases the effective sample size.
+        assert sched._relative_ess(weights, losses, kfn, eps_new) <= ess_current + 1e-9
+
     def test_bisection_holds_when_too_few_accepted(self):
         """Not enough accepted inds ⇒ no tightening."""
         sched = QuantileScheduler(
@@ -1316,6 +1388,192 @@ class TestKernelAwareBisection:
     def test_abcpmc_ess_target_invalid_raises(self):
         with pytest.raises(ValueError, match="ess_target"):
             ABCPMC(LIMITS, ess_target=0.0)
+
+
+class TestTruncationCorrection:
+    """Truncated-proposal density correction (R4): per-component in-box mass."""
+
+    def test_log_box_mass_interior_is_near_zero(self):
+        from propulate.propagators.abcpmc import _log_box_mass
+
+        # Component at the box centre with tiny sigma: essentially all mass is
+        # inside the box, so Z ≈ 1 and log Z ≈ 0.
+        positions = np.array([[0.5, 0.5]])
+        sigma = np.array([0.01, 0.01])
+        lo = np.array([0.0, 0.0])
+        hi = np.array([1.0, 1.0])
+        lz = _log_box_mass(positions, sigma, lo, hi)
+        assert lz.shape == (1,)
+        assert lz[0] == pytest.approx(0.0, abs=1e-6)
+
+    def test_log_box_mass_on_boundary_loses_half(self):
+        from propulate.propagators.abcpmc import _log_box_mass
+
+        # Mean sits exactly on the lower bound of dim 0 (sigma small relative to
+        # the box) → ~half the marginal mass is outside → log Z ≈ log 0.5.
+        positions = np.array([[0.0, 0.5]])
+        sigma = np.array([0.1, 0.01])
+        lo = np.array([0.0, 0.0])
+        hi = np.array([1.0, 1.0])
+        lz = _log_box_mass(positions, sigma, lo, hi)
+        assert lz[0] == pytest.approx(np.log(0.5), abs=1e-3)
+
+    def test_log_box_mass_diagonal_exactness(self):
+        from propulate.propagators.abcpmc import _log_box_mass
+        from scipy.special import ndtr
+
+        # Diagonal covariance: the product-of-marginals equals the true box mass.
+        positions = np.array([[0.3, 0.7]])
+        sigma = np.array([0.2, 0.15])
+        lo = np.array([0.0, 0.0])
+        hi = np.array([1.0, 1.0])
+        lz = _log_box_mass(positions, sigma, lo, hi)
+        expected = 0.0
+        for d in range(2):
+            mass = ndtr((hi[d] - positions[0, d]) / sigma[d]) - ndtr(
+                (lo[d] - positions[0, d]) / sigma[d]
+            )
+            expected += np.log(mass)
+        assert lz[0] == pytest.approx(expected, abs=1e-12)
+
+    def test_box_mass_precomputed_once_per_call(self, monkeypatch):
+        """Hot-path constraint: Z_j is computed once per call (at component-build
+        time), not per candidate and not per snapshot. ndtr-call count must be
+        independent of the number of AMIS snapshots and reject-resample draws."""
+        import propulate.propagators.abcpmc as mod
+
+        abc = ABCPMC(
+            LIMITS, k=5, tol=5.0, kernel="gaussian",
+            amis_snapshots=5, amis_interval=1, additional_needed_inds=0,
+        )
+        history = []
+        rng_np = np.random.default_rng(0)
+        for i in range(20):
+            child = abc(history)
+            child.loss = float(rng_np.uniform(0.0, 1.0))
+            child.generation = i
+            history.append(child)
+        assert len(abc._snapshots) > 1  # several snapshots accumulated
+
+        calls = {"n": 0}
+        orig = mod.ndtr
+
+        def counting_ndtr(x):
+            calls["n"] += 1
+            return orig(x)
+
+        monkeypatch.setattr(mod, "ndtr", counting_ndtr)
+        abc(history)
+        # _log_box_mass invokes ndtr exactly twice (z_hi, z_lo) for the single
+        # current proposal; snapshots reuse their stored log_box_mass.
+        assert calls["n"] == 2
+
+
+class TestExtractPosterior:
+    """Retroactive AMIS posterior estimator (R1) and its statelessness (R2)."""
+
+    LIMITS_1D = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+
+    def _run_gaussian_mean(self, y, *, seed=0, n=600, k=40, ps=0.8):
+        """Drive ABCPMC on a 1D Gaussian-mean ABC problem (loss = |x - y|)."""
+        abc = ABCPMC(
+            self.LIMITS_1D, k=k, tol=1.0, scheduler_type="acceptance_rate",
+            kernel="gaussian", additional_needed_inds=0,
+            perturbation_scale=ps, rng=random.Random(seed),
+        )
+        history = []
+        for i in range(n):
+            child = abc(history)
+            child.loss = abs(child.position[0] - y)
+            child.generation = i
+            history.append(child)
+        return abc, history
+
+    def test_weights_normalized(self):
+        abc, history = self._run_gaussian_mean(0.6)
+        pos, w = abc.extract_posterior(history)
+        assert pos.shape == (len(history), 2)
+        assert w.shape == (len(history),)
+        assert w.sum() == pytest.approx(1.0)
+        assert np.all(w >= 0.0)
+
+    def test_recovers_gaussian_mean(self):
+        abc, history = self._run_gaussian_mean(0.6)
+        pos, w = abc.extract_posterior(history)
+        mean = np.average(pos, axis=0, weights=w)
+        assert mean[0] == pytest.approx(0.6, abs=0.05)
+
+    def test_crash_restart_invariance(self):
+        """Estimator is a pure function of history: a fresh propagator with an
+        empty snapshot buffer (as after a crash/restart) yields a bit-identical
+        posterior. This is the statelessness / crash-recoverability claim (R2)."""
+        abc, history = self._run_gaussian_mean(0.6, seed=0)
+        pos1, w1 = abc.extract_posterior(history)
+        fresh = ABCPMC(
+            self.LIMITS_1D, k=40, tol=1.0, scheduler_type="acceptance_rate",
+            kernel="gaussian", additional_needed_inds=0, rng=random.Random(999),
+        )
+        assert len(fresh._snapshots) == 0  # empty buffer, as after a restart
+        pos2, w2 = fresh.extract_posterior(history)
+        np.testing.assert_array_equal(pos1, pos2)
+        np.testing.assert_array_equal(w1, w2)
+
+    def test_reweighting_is_retroactive(self):
+        """Defining AMIS property: a particle's weight depends on the WHOLE
+        history (the current cumulative mixture), not only proposals up to its
+        arrival. With eps_final fixed, the weight ratio of two fixed particles
+        changes as later history is appended — impossible for frozen forward
+        weights."""
+        abc, history = self._run_gaussian_mean(0.6, seed=0, n=800)
+        eps = 0.05
+        half = history[:400]
+        order = sorted(range(400), key=lambda idx: half[idx].loss)
+        i, j = order[0], order[1]
+        _, w_half = abc.extract_posterior(half, eps_final=eps)
+        _, w_full = abc.extract_posterior(history, eps_final=eps)
+        ratio_half = w_half[i] / w_half[j]
+        ratio_full = w_full[i] / w_full[j]
+        assert not np.isclose(ratio_half, ratio_full, rtol=1e-6)
+
+    def test_bootstrap_only_history_returns_uniform(self):
+        """Before the archive phase (history < k) every draw is a uniform prior
+        draw → equal weights."""
+        abc = ABCPMC(self.LIMITS_1D, k=50, tol=1.0, kernel="gaussian")
+        history = [make_ind(loss=1.0, generation=i) for i in range(10)]  # < k
+        pos, w = abc.extract_posterior(history)
+        assert np.allclose(w, 1.0 / len(history))
+
+    def test_hard_kernel_extraction_runs(self):
+        """Hard-kernel extraction produces a valid normalised posterior."""
+        abc = ABCPMC(
+            self.LIMITS_1D, k=20, tol=1.0, scheduler_type="quantile",
+            kernel="hard", additional_needed_inds=0, percentile=50.0,
+            rng=random.Random(3),
+        )
+        history = []
+        for i in range(400):
+            child = abc(history)
+            child.loss = abs(child.position[0] - 0.4)
+            child.generation = i
+            history.append(child)
+        _, w = abc.extract_posterior(history)
+        assert w.sum() == pytest.approx(1.0)
+
+    def test_truncation_reduces_near_boundary_weight(self, monkeypatch):
+        """R4 end-to-end: with the box-mass correction active, near-boundary
+        particles carry less of the posterior weight than under the untruncated
+        density (which over-counts their proposal probability). The effect on the
+        posterior *mean* is negligible for this self-tightening archive, so the
+        regression targets the weight mechanism directly."""
+        import propulate.propagators.abcpmc as mod
+
+        abc, history = self._run_gaussian_mean(0.05, seed=0, n=800, k=40, ps=2.0)
+        pos = np.array([ind.position for ind in history])
+        near = pos[:, 0] < 0.12  # near the lower boundary
+        _, w_corrected = abc.extract_posterior(history, eps_final=0.3)
+        monkeypatch.setattr(mod, "_log_box_mass", lambda p, s, lo, hi: np.zeros(len(p)))
+        _, w_uncorrected = abc.extract_posterior(history, eps_final=0.3)
+        assert w_corrected[near].sum() < w_uncorrected[near].sum()
 
 
 # ===========================================================================
