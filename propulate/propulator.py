@@ -316,8 +316,18 @@ class Propulator:
 
     def _receive_intra_island_individuals(self) -> None:
         """Check for and possibly receive incoming individuals evaluated by other workers within own island."""
+        # Building the debug log string — and especially the O(N) active-individual
+        # scan at the end — every generation dominates the steady-state cost at
+        # large populations / high intra-island message volume (async ABC with a
+        # cheap simulator reaches ~1e5-1e6 individuals/rank). It is pure waste when
+        # DEBUG is off (the default during runs), and the slow per-generation cost
+        # is what makes >=2-node workers miss the post-loop teardown window and get
+        # Force-Terminated. Only build it when DEBUG is actually enabled.
+        _debug = log.isEnabledFor(logging.DEBUG)
         log_string = (
             f"Island {self.island_idx} Worker {self.island_comm.rank} Generation {self.generation}: INTRA-ISLAND SYNCHRONIZATION\n"
+            if _debug
+            else ""
         )
         probe_ind = True
         while probe_ind:
@@ -326,7 +336,8 @@ class Propulator:
             # If True, continue checking for incoming messages. Tells whether message corresponding
             # to filters passed is waiting for reception via a flag that it sets.
             # If no such message has arrived yet, it returns False.
-            log_string += f"Incoming individual to receive?...{probe_ind}\n"
+            if _debug:
+                log_string += f"Incoming individual to receive?...{probe_ind}\n"
             if probe_ind:
                 # Receive individual and add it to own population.
                 ind_temp = self.island_comm.recv(source=stat.Get_source(), tag=INDIVIDUAL_TAG)
@@ -340,10 +351,12 @@ class Propulator:
 
                 self.population.append(ind_temp)  # Add received individual to own worker-local population.
 
-                log_string += f"Added individual {ind_temp} from W{stat.Get_source()} to own population.\n"
-        _, n_active = self._get_active_individuals()
-        log_string += f"After probing within island: {n_active}/{len(self.population)} active."
-        log.debug(log_string)
+                if _debug:
+                    log_string += f"Added individual {ind_temp} from W{stat.Get_source()} to own population.\n"
+        if _debug:
+            _, n_active = self._get_active_individuals()
+            log_string += f"After probing within island: {n_active}/{len(self.population)} active."
+            log.debug(log_string)
 
     def _send_emigrants(self) -> None:
         """
