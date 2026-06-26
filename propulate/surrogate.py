@@ -1,7 +1,11 @@
 import random
 from typing import Any, Dict, Tuple, TypeVar, Union
 
-import GPy
+# GPy is imported lazily inside DynamicSurrogate.__init__ (the only user). It pulls
+# in a heavy transitive tree (GPy -> IPython -> astroid); importing it eagerly makes
+# every `import propulate` slow and, at high rank counts from a shared filesystem,
+# storms the metadata server and crashes a rank mid-import. The ABC path never
+# instantiates a surrogate, so it should never pay this cost.
 import numpy as np
 from mpi4py import MPI
 
@@ -390,6 +394,9 @@ class DynamicSurrogate(Surrogate):
         limits : Union[Dict[str, Tuple[float, float]], Dict[str, Tuple[int, int]], Dict[str, Tuple[str, ...]]
             The hyperparameter configuration space's limits.
         """
+        global GPy
+        import GPy  # lazy: only load the heavy GPy/IPython tree when a GP surrogate is used
+
         self.limits = limits
 
         # History arrays to store (encoded configuration, final loss) pairs
