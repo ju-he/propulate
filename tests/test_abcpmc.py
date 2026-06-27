@@ -1543,6 +1543,24 @@ class TestExtractPosterior:
         pos, w = abc.extract_posterior(history)
         assert np.allclose(w, 1.0 / len(history))
 
+    def test_chunking_matches_unchunked(self, monkeypatch):
+        """Chunked retroactive reweighting is bit-identical to the unchunked
+        computation. ``extract_posterior`` evaluates the cumulative mixture in
+        chunks over the history so the per-snapshot (n, k) distance matrix never
+        materialises over the full (multi-million-row) history — the fix for the
+        Gaussian-mean post-run OOM. logsumexp is column-wise, so each particle's
+        weight is independent of the chunk boundaries: the result must not change.
+        """
+        import propulate.propagators.abcpmc as abcpmc_mod
+
+        abc, history = self._run_gaussian_mean(0.6, seed=0, n=600)
+        monkeypatch.setattr(abcpmc_mod, "_EXTRACT_POSTERIOR_CHUNK", 10**9)
+        pos_ref, w_ref = abc.extract_posterior(history)
+        monkeypatch.setattr(abcpmc_mod, "_EXTRACT_POSTERIOR_CHUNK", 7)  # << n: many chunks
+        pos_chunk, w_chunk = abc.extract_posterior(history)
+        np.testing.assert_array_equal(pos_ref, pos_chunk)
+        np.testing.assert_array_equal(w_ref, w_chunk)
+
     def test_hard_kernel_extraction_runs(self):
         """Hard-kernel extraction produces a valid normalised posterior."""
         abc = ABCPMC(

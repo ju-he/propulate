@@ -150,6 +150,13 @@ def _log_box_mass(
     return np.log(mass).sum(axis=1)  # (k,)
 
 
+# Rows processed per chunk in ABCPMC.extract_posterior. Bounds the retroactive
+# AMIS reweighting to O(chunk · k) memory so a fast simulator's multi-million
+# individual history does not allocate an (n, k) matrix of tens of GB. Large
+# enough that the per-chunk Python/NumPy overhead is negligible.
+_EXTRACT_POSTERIOR_CHUNK = 65_536
+
+
 class _ArchiveSnapshot:
     """Frozen view of the proposal distribution used at one past call.
 
@@ -1025,16 +1032,27 @@ class ABCPMC(Propagator):
         # Cumulative proposal mixture q̄, evaluated at EVERY particle (the
         # retroactive step). A uniform-prior component covers the bootstrap draws
         # and keeps q̄ strictly positive on the whole box (bounded weights).
+        #
+        # Evaluated in CHUNKS over the n history points so peak memory is
+        # O(chunk · k) instead of O(n · k). Each snapshot's log_mixture_density
+        # materialises an (n, k) Mahalanobis-distance matrix; for a fast
+        # simulator whose evaluated history reaches many millions of individuals
+        # (e.g. Gaussian-mean: ~1e3 sims/s/worker × 48 workers × 300 s ≈ 1e7),
+        # the unchunked (n, k) allocation is tens of GB and OOM-kills the rank
+        # in the post-run analysis phase. logsumexp is applied per row, so the
+        # chunked result is bit-for-bit the same as the unchunked computation.
         m = len(snapshots)
         log_prior = float(np.log(self.prior_density))
-        log_components = np.empty((m + 1, n))
-        for s, snap in enumerate(snapshots):
-            log_components[s] = snap.log_mixture_density(positions)
-        log_components[m] = log_prior
-        log_qbar = logsumexp(log_components, axis=0) - np.log(m + 1)
-
         log_kernel = self._kernel_fn.log_weight(losses, eps_final)
-        log_w = log_prior + log_kernel - log_qbar
+        log_w = np.empty(n)
+        for start in range(0, n, _EXTRACT_POSTERIOR_CHUNK):
+            stop = min(start + _EXTRACT_POSTERIOR_CHUNK, n)
+            comp = np.empty((m + 1, stop - start))
+            for s, snap in enumerate(snapshots):
+                comp[s] = snap.log_mixture_density(positions[start:stop])
+            comp[m] = log_prior
+            log_qbar = logsumexp(comp, axis=0) - np.log(m + 1)
+            log_w[start:stop] = log_prior + log_kernel[start:stop] - log_qbar
         finite = np.isfinite(log_w)
         if not finite.any():
             return positions, np.full(n, 1.0 / n)
