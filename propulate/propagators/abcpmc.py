@@ -1092,6 +1092,36 @@ class ABCPMC(Propagator):
         weights : np.ndarray, shape (n,)
             Self-normalised importance weights
             ``w_i ∝ π(θ_i) · K_{ε_final}(ρ_i) / q̄(θ_i)`` summing to 1.
+
+        Notes
+        -----
+        Three approximations scope the consistency claims:
+
+        * **Asynchronous replay.** Under MPI each rank's history interleaves
+          its own and received individuals in arrival order, so ``inds`` — and
+          therefore the replayed prefixes ``inds[:tau]`` — are rank-dependent
+          and need not equal the breeding worker's actual view at call ``tau``.
+          "Pure function of the history" (which grounds crash-recoverability)
+          is exact; "faithful replay of the proposal sequence" is exact only
+          single-rank and an approximation under asynchrony. The balance
+          heuristic's consistency requires ``q̄`` to approximate the true draw
+          mixture, so the rank-to-rank variation of the reported posterior
+          bounds this error empirically (see the order-sensitivity experiment
+          in ``tests/benchmarks/bench_abcpmc.py``); proposals evolve slowly —
+          the top-k archive is stable to local reordering — which keeps the
+          effect small in practice.
+        * **Underflow retries.** ``__call__`` redraws a candidate (up to
+          ``_MAX_WEIGHT_RETRIES`` times) when the proposal-time denominator
+          underflows ``_MIN_DENOM``, conditioning the effective proposal on
+          ``q̄ ≥ floor`` without a weight correction. The affected region
+          carries proposal density below 1e-12 — negligible proposal mass.
+        * **Prior fallback.** When reject-resampling exhausts its attempts,
+          the candidate is drawn from the prior and weighted as a pure prior
+          draw (weight 1), ignoring the two-stage mixture structure of the
+          fallback event. Exact when the fallback probability given the
+          covariance is ≈ 0 or ≈ 1 (the typical regimes, since the in-box
+          mass makes the 1000-attempt failure probability effectively 0/1);
+          approximate in between.
         """
         n = len(inds)
         d = len(self.limits)

@@ -91,6 +91,62 @@ def profile_call(prop: ABCPMC, inds: list[Individual], n_calls: int = 50):
     print(stream.getvalue())
 
 
+def order_sensitivity_experiment(n: int = 2000, k: int = 50, window: int = 20, seed: int = 0) -> None:
+    """Quantify the rank-order sensitivity of ``extract_posterior``.
+
+    Under MPI, each rank's population interleaves its own and received
+    individuals in arrival order, so the history handed to
+    ``extract_posterior`` is rank-dependent. The retroactive reweighting
+    replays proposals from *that* order (see the Notes section of
+    ``extract_posterior``), so the reported posterior varies slightly from
+    rank to rank. This experiment bounds the effect: it drives a
+    single-worker gaussian-mean run, re-runs the extraction on a locally
+    shuffled copy of the same individuals (permutation within windows of
+    ``window`` — a model of message-arrival skew, which reorders nearby
+    arrivals but preserves global progress), and reports the discrepancy in
+    posterior mean plus the total-variation distance between the two weight
+    vectors.
+    """
+    limits = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+    abc = ABCPMC(
+        limits, k=k, tol=1.0, kernel="gaussian", scheduler_type="acceptance_rate",
+        additional_needed_inds=0, rng=random.Random(seed),
+    )
+    history: list[Individual] = []
+    for i in range(n):
+        child = abc(history)
+        child.loss = abs(child.position[0] - 0.6)
+        child.generation = i
+        history.append(child)
+
+    rng = np.random.default_rng(seed)
+    shuffled = list(history)
+    for start in range(0, n, window):
+        stop = min(start + window, n)
+        perm = rng.permutation(stop - start)
+        shuffled[start:stop] = [shuffled[start + int(p)] for p in perm]
+
+    eps = min(ind.tolerance for ind in history if ind.tolerance is not None)
+    pos1, w1 = abc.extract_posterior(history, eps_final=eps)
+    pos2, w2 = abc.extract_posterior(shuffled, eps_final=eps)
+
+    mean1 = np.average(pos1, axis=0, weights=w1)
+    mean2 = np.average(pos2, axis=0, weights=w2)
+
+    # Match weights particle-by-particle (by identity) for the TV distance.
+    index_of = {id(ind): i for i, ind in enumerate(history)}
+    w2_aligned = np.empty_like(w2)
+    for j, ind in enumerate(shuffled):
+        w2_aligned[index_of[id(ind)]] = w2[j]
+    tv = 0.5 * float(np.abs(w1 - w2_aligned).sum())
+
+    print(f"  history n                 : {n} (k={k}, local shuffle window={window})")
+    print(f"  posterior mean (orig)     : {mean1}")
+    print(f"  posterior mean (shuffled) : {mean2}")
+    print(f"  |dmean|                   : {np.abs(mean1 - mean2)}")
+    print(f"  TV(w_orig, w_shuffled)    : {tv:.4f}")
+
+
 def main() -> None:
     print("ABCPMC __call__ microbenchmark")
     print("=" * 70)
@@ -108,6 +164,9 @@ def main() -> None:
 
     print("\n-- cProfile (top 25 by cumtime) --")
     profile_call(prop, inds, n_calls=50)
+
+    print("\n-- extract_posterior order sensitivity (async-replay approximation) --")
+    order_sensitivity_experiment()
 
 
 if __name__ == "__main__":
