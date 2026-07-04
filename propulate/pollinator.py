@@ -206,7 +206,7 @@ class Pollinator(Propulator):
                 for immigrant in immigrants:
                     immigrant.migration_steps += 1
                     assert immigrant.active is True
-                    self.population.append(copy.deepcopy(immigrant))  # Append immigrant to population.
+                    self._append_to_population(copy.deepcopy(immigrant))  # Append immigrant to population.
 
                     replace_num = 0
                     if self.island_comm.rank == immigrant.current:
@@ -234,10 +234,13 @@ class Pollinator(Propulator):
                         )
 
                     # Deactivate individuals to be replaced in own population.
+                    # to_replace holds references to population members, so
+                    # deactivating through the helper keeps the active view
+                    # in sync.
                     for individual in to_replace:
                         assert isinstance(individual, Individual)
                         assert individual.active is True
-                        individual.active = False
+                        self._deactivate_individual(individual)
 
         _, num_active = self._get_active_individuals()
         log_string += f"After immigration: {num_active}/{len(self.population)} active."
@@ -275,7 +278,7 @@ class Pollinator(Propulator):
             # NOTE As copies are allowed, len(to_deactivate) can be greater than 1.
             # However, only one of the copies should be replaced / deactivated.
             _, num_active_before = self._get_active_individuals()
-            self.population[to_deactivate[0]].active = False
+            self._deactivate_individual(self.population[to_deactivate[0]])
             self.replaced.remove(individual)
             _, num_active_after = self._get_active_individuals()
             log_string += (

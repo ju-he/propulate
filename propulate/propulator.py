@@ -193,9 +193,39 @@ class Propulator:
             if self.island_comm.rank == 0:
                 log.info("No valid checkpoint file given. Initializing population randomly...")
 
+        # Incrementally maintained view of the active population. Rebuilding
+        # it with an O(N) scan on every breed dominates the steady-state cost
+        # once the population reaches ~1e5-1e6 individuals (async ABC with a
+        # cheap simulator): the scan is quadratic over a run and dwarfs a
+        # sub-millisecond propagator call. Appends update the view in O(1);
+        # deactivations (rare — only on migration events) mark it stale via
+        # _deactivate_individual and the next access rebuilds it once.
+        self._active_pop: List[Individual] = []
+        self._active_stale: bool = True  # population may come from a checkpoint
+
+    def _append_to_population(self, ind: Individual) -> None:
+        """Append *ind* to the population, keeping the active view in sync."""
+        self.population.append(ind)
+        if ind.active:
+            self._active_pop.append(ind)
+
+    def _deactivate_individual(self, ind: Individual) -> None:
+        """Deactivate *ind* and invalidate the cached active view.
+
+        All deactivations must go through here (or set ``_active_stale``);
+        flipping ``ind.active`` directly would leave the cached view stale.
+        """
+        ind.active = False
+        self._active_stale = True
+
     def _get_active_individuals(self) -> Tuple[List[Individual], int]:
         """
         Get active individuals in current population list.
+
+        Returns the incrementally maintained live list — callers (including
+        propagators, which receive it as their input) must treat it as
+        read-only; it is refreshed in place by appends and rebuilt after
+        deactivations.
 
         Returns
         -------
@@ -204,8 +234,10 @@ class Propulator:
         int
             The number of currently active individuals.
         """
-        active_pop = [ind for ind in self.population if ind.active]
-        return active_pop, len(active_pop)
+        if self._active_stale:
+            self._active_pop = [ind for ind in self.population if ind.active]
+            self._active_stale = False
+        return self._active_pop, len(self._active_pop)
 
     def _breed(self) -> Individual:
         """
@@ -293,7 +325,7 @@ class Propulator:
             return
         ind.evaltime = time.time()  # Stop evaluation timer.
         ind.evalperiod = ind.evaltime - start_time  # Calculate evaluation duration.
-        self.population.append(ind)  # Add evaluated individual to worker-local population.
+        self._append_to_population(ind)  # Add evaluated individual to worker-local population.
         log.debug(
             f"Island {self.island_idx} Worker {self.island_comm.rank} Generation {self.generation}: BREEDING\n"
             f"Bred and evaluated individual {ind}."
@@ -349,7 +381,7 @@ class Propulator:
                 if SURROGATE_KEY in ind_temp:
                     del ind_temp[SURROGATE_KEY]
 
-                self.population.append(ind_temp)  # Add received individual to own worker-local population.
+                self._append_to_population(ind_temp)  # Add received individual to own worker-local population.
 
                 if _debug:
                     log_string += f"Added individual {ind_temp} from W{stat.Get_source()} to own population.\n"
@@ -512,6 +544,16 @@ class Propulator:
 
     def _dump_checkpoint(self) -> None:
         """Dump checkpoint to file."""
+        if os.environ.get("PROPULATE_DISABLE_CHECKPOINT"):
+            # Diagnostic/perf mode: skip periodic checkpointing entirely. On a
+            # near-instant simulator the shared population grows to ~1e6
+            # individuals, so pickling it every generation (O(N), >200 MB) is a
+            # multi-second serial stall that rotates through ranks via the
+            # DUMP_TAG token and starves the async loop. Results are built from
+            # the in-memory population (not the checkpoint), so skipping this is
+            # safe for non-resumable benchmark runs. Returning before the token
+            # send stops the round-robin, so no rank dumps.
+            return
         log.debug(f"Island {self.island_idx} Worker {self.island_comm.rank} Generation {self.generation}: Dumping checkpoint...")
         save_ckpt_file = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
         if os.path.isfile(save_ckpt_file):
@@ -543,6 +585,8 @@ class Propulator:
 
     def _dump_final_checkpoint(self) -> None:
         """Dump final checkpoint."""
+        if os.environ.get("PROPULATE_DISABLE_CHECKPOINT"):
+            return
         save_ckpt_file = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
         if os.path.isfile(save_ckpt_file):
             try:

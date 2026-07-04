@@ -185,7 +185,7 @@ class Migrator(Propulator):
                     ]
                     assert len(to_deactivate) == 1  # There should be exactly one!
                     _, n_active_before = self._get_active_individuals()
-                    self.population[to_deactivate[0]].active = False  # Deactivate emigrant in population.
+                    self._deactivate_individual(self.population[to_deactivate[0]])  # Deactivate emigrant in population.
                     _, n_active_after = self._get_active_individuals()
                     log_string += (
                         f"Deactivated own emigrant {self.population[to_deactivate[0]]}. "
@@ -240,7 +240,7 @@ class Migrator(Propulator):
                         raise RuntimeError(
                             log_string + f"Identical immigrant {immigrant} already active on target  island {self.island_idx}."
                         )
-                    self.population.append(copy.deepcopy(immigrant))  # Append immigrant to population.
+                    self._append_to_population(copy.deepcopy(immigrant))  # Append immigrant to population.
                     log_string += f"Added immigrant {immigrant} to population.\n"
 
                     # NOTE Do not remove obsolete individuals from population upon immigration
@@ -319,7 +319,7 @@ class Migrator(Propulator):
                     log_string += f"Individual {emigrant} to deactivate not yet received.\n"
                     continue
                 assert len(to_deactivate) == 1
-                self.population[to_deactivate[0]].active = False
+                self._deactivate_individual(self.population[to_deactivate[0]])
                 to_remove = [
                     idx
                     for idx, ind in enumerate(self.emigrated)
