@@ -336,9 +336,23 @@ class _IncrementalCache:
         return self._accepted_by_loss.bisect_key_left(tol)
 
     def get_archive(self, tol: float, k: int) -> list:
-        """Return top-*k* individuals with loss < *tol*, sorted by loss."""
-        n = self._accepted_by_loss.bisect_key_left(tol)
-        return list(self._accepted_by_loss[: min(n, k)])
+        """Return top-*k* mixture-eligible individuals with loss < *tol*, by loss.
+
+        Individuals with ``weight == 0`` (underflow-exhausted candidates) are
+        skipped: a zero-weight particle contributes nothing to the proposal
+        mixture and can never be selected as a parent, so letting it occupy
+        one of the ``k`` slots would silently shrink the effective mixture.
+        ``weight is None`` (external propagator) stays eligible — it falls
+        back to 1.0 in the proposal build. Zero-weight individuals are rare,
+        so the lazy scan stays O(k) in practice.
+        """
+        out = []
+        for ind in self._accepted_by_loss.irange_key(None, tol, inclusive=(True, False)):
+            if ind.weight is None or ind.weight > 0.0:
+                out.append(ind)
+                if len(out) == k:
+                    break
+        return out
 
 
 class ABCPMC(Propagator):
@@ -719,6 +733,10 @@ class ABCPMC(Propagator):
         asynchronous-ABC paper plan; under smooth kernels the kernel weight
         ``K_eps(rho)`` provides the additional decay.
 
+        Individuals with ``weight == 0`` are not eligible: they contribute
+        nothing to the proposal mixture, so they must not occupy archive
+        slots (see :meth:`_IncrementalCache.get_archive`).
+
         Parameters
         ----------
         inds : List[Individual]
@@ -729,10 +747,12 @@ class ABCPMC(Propagator):
         Returns
         -------
         List[Individual]
-            Top-k accepted individuals sorted by loss (ascending).
+            Top-k accepted, mixture-eligible individuals sorted by loss
+            (ascending).
         """
         accepted = self.filter_by_tolerance(inds, tol)
-        return sorted(accepted, key=lambda ind: ind.loss)[: self.k]
+        eligible = [ind for ind in accepted if ind.weight is None or ind.weight > 0.0]
+        return sorted(eligible, key=lambda ind: ind.loss)[: self.k]
 
     def weighted_covariance(self, values: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """
@@ -1054,14 +1074,17 @@ class ABCPMC(Propagator):
 
         Mirrors :meth:`select_archive` / the cache's ``get_archive``: hard kernel
         keeps the top-k by loss among ``loss < eps``; smooth kernels keep the
-        top-k by loss overall. Returns ``None`` if fewer than ``k`` candidates
-        exist (the call would still have been in the bootstrap phase).
+        top-k by loss overall; ``weight == 0`` individuals are not eligible
+        (same rule as the live selection, so the replay stays faithful).
+        Returns ``None`` if fewer than ``k`` candidates exist (the call would
+        still have been in the bootstrap phase).
         """
         if self.kernel_name == "hard":
             accepted = [ind for ind in prefix if ind.loss < eps]
-            archive = sorted(accepted, key=lambda i: i.loss)[: self.k]
         else:
-            archive = sorted(prefix, key=lambda i: i.loss)[: self.k]
+            accepted = prefix
+        eligible = [ind for ind in accepted if ind.weight is None or ind.weight > 0.0]
+        archive = sorted(eligible, key=lambda i: i.loss)[: self.k]
         if len(archive) < self.k:
             return None
         return archive

@@ -389,6 +389,41 @@ class TestABCPMCEdgeCases:
         child = abc(inds=inds)  # must not raise
         assert child is not None
 
+    def test_zero_weight_individual_does_not_occupy_archive_slot(self):
+        """3c: a weight=0 individual (underflow-exhausted candidate) has zero
+        mixture weight and can never be selected as a parent, so it must not
+        displace a live particle from the k archive slots."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
+        dead = make_ind(loss=0.1, tolerance=10.0, generation=0)
+        dead.weight = 0.0
+        inds = [dead]
+        for i in range(4):
+            ind = Individual({"x": 0.2 * (i + 1), "y": 0.5}, LIMITS,
+                             tolerance=10.0, generation=i + 1)
+            ind.loss = float(i + 1)
+            ind.weight = 1.0
+            inds.append(ind)
+        abc(inds=inds)  # populate the cache
+        archive = abc._cache.get_archive(10.0, 3)
+        assert all(a is not dead for a in archive)
+        assert [a.loss for a in archive] == [1.0, 2.0, 3.0]
+        # Public reference implementation applies the same rule.
+        archive2 = abc.select_archive(inds, 10.0)
+        assert all(a is not dead for a in archive2)
+        assert [a.loss for a in archive2] == [1.0, 2.0, 3.0]
+
+    def test_reconstruct_archive_mirrors_zero_weight_exclusion(self):
+        """3c: the extract_posterior replay must apply the same eligibility
+        rule as the live selection."""
+        abc = ABCPMC(LIMITS, k=2, tol=10.0, kernel="gaussian")
+        dead = make_ind(loss=0.1, tolerance=1.0, generation=0)
+        dead.weight = 0.0
+        live = make_inds([1.0, 2.0, 3.0], tolerance=1.0, base_generation=1)
+        archive = abc._reconstruct_archive([dead] + live, 1.0)
+        assert archive is not None
+        assert all(a is not dead for a in archive)
+        assert [a.loss for a in archive] == [1.0, 2.0]
+
     def test_jitter_does_not_swamp_converged_archive(self):
         """Scale-aware jitter (1c): for a tightly-converged archive (posterior
         std ~1e-4) the proposal covariance must track the archive covariance.
