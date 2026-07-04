@@ -347,15 +347,22 @@ class ABCPMC(Propagator):
     what makes "stateless / crash-recoverable" hold for the *estimator*, not just
     the archive.
 
-    The per-call ``Individual.weight`` and the AMIS snapshot ring buffer are
-    **proposal-side performance state**: the stored weight steers parent
-    selection and the buffer supplies the proposal-time importance denominator,
-    but neither feeds :meth:`extract_posterior`, so a stale or empty buffer
-    changes only proposal quality, never the reported posterior. The buffer is
-    cleared on a genuine history rollback (shrink or non-append-only mutation
-    under island migration) so a rolled-back future cannot leak forward. ``inds``
-    is append-only in single-island runs; under migration the cache detects the
-    non-append-only case and rebuilds.
+    The AMIS snapshot ring buffer is **proposal-side performance state**: it
+    supplies the proposal-time importance denominator and never feeds
+    :meth:`extract_posterior`, so a stale or empty buffer changes only proposal
+    quality, never the reported posterior. The buffer is cleared on a genuine
+    history rollback (shrink or non-append-only mutation under island
+    migration) so a rolled-back future cannot leak forward. The per-call
+    ``Individual.weight`` is subtler: it is never used *as a particle's
+    importance weight* in the reported posterior (that weight is recomputed
+    retroactively), but it **is** read during the proposal reconstruction —
+    :meth:`extract_posterior` replays past proposals via
+    :meth:`_build_proposal`, whose mixture weights are built from the stored
+    per-individual weights. That is deliberate: the stored weight is part of
+    the history that determines which proposal was actually used, and it is
+    checkpointed with the individual, so the replay stays faithful across a
+    restart. ``inds`` is append-only in single-island runs; under migration
+    the cache detects the non-append-only case and rebuilds.
 
     Kernel modes
     ------------
@@ -1044,8 +1051,11 @@ class ABCPMC(Propagator):
         particle is reweighted against the **current cumulative proposal
         mixture** (the balance heuristic of Cornuet et al. 2012), not against the
         proposal-time mixture frozen onto it during the run. The per-call
-        ``Individual.weight`` is only a proposal-selection device; the posterior
-        the paper reports is this quantity.
+        ``Individual.weight`` is never used *as a particle's importance weight*
+        here — it enters only through the proposal reconstruction
+        (:meth:`_build_proposal` rebuilds each past mixture's component weights
+        from the stored per-individual weights, which is what makes the replay
+        faithful). The posterior the paper reports is this quantity.
 
         It is a **pure function of** ``inds`` — the proposal sequence is replayed
         deterministically from history — so the result is identical whether
