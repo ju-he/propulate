@@ -500,6 +500,19 @@ class ABCPMC(Propagator):
             ``"epanechnikov"``); ignored for the hard kernel which retains the
             loss-quantile / acceptance-rate / geometric-decay schedule. Must
             lie in ``(0, 1]``; default ``0.95`` (retain 95% of ESS per step).
+
+            Semantics: tightening only proceeds while at least
+            ``k + additional_needed_inds`` individuals satisfy ``loss < ε``
+            (the scheduler's gate), so the bandwidth equilibrates near the
+            ``(k + additional_needed_inds)``-th smallest loss seen so far and
+            keeps tracking that order statistic as evaluations accumulate.
+            ``ess_target`` therefore controls the *approach speed* toward that
+            equilibrium, not the final posterior sharpness — use ``min_tol``
+            to pin an explicit floor. Note also that the retention rule fires
+            per ``__call__`` (per bred individual), not once per SMC
+            population as in the original formulation, so the same
+            ``ess_target`` tightens faster with more workers (see
+            :class:`EpsilonScheduler`).
         max_tighten_factor : float
             Per-call tightening cap for the kernel-aware bandwidth search:
             any proposed ε is floored at ``max_tighten_factor · current_tol``,
@@ -1257,6 +1270,17 @@ class EpsilonScheduler(ABC):
     proposal is floored at ``max_tighten_factor · current_tol`` so a flat ESS
     curve (e.g. tied losses from discrete summary statistics) tightens at a
     bounded rate instead of collapsing.
+
+    Cadence: the retention rule fires on every ``compute`` call — per bred
+    individual in the asynchronous steady state, not once per SMC population
+    as in the original formulation — so the same ``ess_target`` tightens
+    faster with more workers. The acceptance gate (at least
+    ``population_size + additional_needed_inds`` individuals with
+    ``loss < ε``) throttles this: after tightening, the accepted count drops
+    and the bandwidth holds until enough new evaluations accumulate below the
+    new ε, so ε equilibrates near that order statistic of the losses and
+    ``ess_target`` (with ``max_tighten_factor``) sets only how fast it is
+    approached.
 
     For the hard kernel or ``kernel_aware=False`` the schedulers retain
     their original loss-quantile / acceptance-rate / geometric-decay
