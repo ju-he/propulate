@@ -596,6 +596,14 @@ class ABCPMC(Propagator):
         """
         super().__init__(-1, 1, rng=rng)
         self.limits = limits
+        # Validate the primary input (limits) first, then independent scalar
+        # arguments; the cross-parameter tol-requires-hard-kernel check comes
+        # last so a wrong argument is never masked by a merely missing one.
+        float_limits = {key: v for key, v in limits.items() if isinstance(v[0], (float, np.floating))}
+        if len(float_limits) != len(limits):
+            raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
+        if any(hi <= lo for lo, hi in float_limits.values()):
+            raise ValueError("ABCPMC limits must satisfy lo < hi for every dimension.")
         if perturbation_scale <= 0.0:
             raise ValueError("perturbation_scale must be > 0.")
         self.perturbation_scale = perturbation_scale
@@ -611,6 +619,14 @@ class ABCPMC(Propagator):
             raise ValueError("additional_needed_inds must be >= 0.")
         else:
             self.additional_needed_inds = additional_needed_inds
+        if not (0.0 < ess_target <= 1.0):
+            raise ValueError("ess_target must be in (0, 1].")
+        self.ess_target = float(ess_target)
+        if not (0.0 < max_tighten_factor < 1.0):
+            raise ValueError("max_tighten_factor must be in (0, 1).")
+        self.max_tighten_factor = float(max_tighten_factor)
+        if bisect_interval is not None and bisect_interval < 1:
+            raise ValueError("bisect_interval must be >= 1.")
         self.kernel_name = kernel
         self._kernel_fn: _Kernel = _make_kernel(kernel)
         self._kernel_aware = kernel != "hard"
@@ -629,14 +645,6 @@ class ABCPMC(Propagator):
         # "no bandwidth fixed yet"; the data-driven value replaces it in
         # __call__ once k finite-loss individuals exist.
         self._tol_fallback = tol if tol is not None else float("inf")
-        if not (0.0 < ess_target <= 1.0):
-            raise ValueError("ess_target must be in (0, 1].")
-        self.ess_target = float(ess_target)
-        if not (0.0 < max_tighten_factor < 1.0):
-            raise ValueError("max_tighten_factor must be in (0, 1).")
-        self.max_tighten_factor = float(max_tighten_factor)
-        if bisect_interval is not None and bisect_interval < 1:
-            raise ValueError("bisect_interval must be >= 1.")
         self.tolerance_scheduler = create_scheduler(
             scheduler_type,
             self._tol_fallback,
@@ -659,12 +667,7 @@ class ABCPMC(Propagator):
         self.rng_np = np.random.default_rng(
             self.rng.getrandbits(128)
         )  # Derive NumPy seed from Propagator RNG
-        # Uniform prior density = 1 / volume (float limits only)
-        float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], (float, np.floating))}
-        if len(float_limits) != len(self.limits):
-            raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
-        if any(hi <= lo for lo, hi in float_limits.values()):
-            raise ValueError("ABCPMC limits must satisfy lo < hi for every dimension.")
+        # Uniform prior density = 1 / volume (float limits validated above).
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
         # Constant box bounds, used by the proposal build and box-mass correction.
