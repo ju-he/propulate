@@ -1228,7 +1228,12 @@ class TestKernelAwareBisection:
         assert 0.0 < eps_aware <= 1.0
 
     def test_bisection_achieves_target_ess(self):
-        """Relative ESS at the bisected ε should match the target within tolerance."""
+        """Relative ESS at the returned ε should match the target within tolerance.
+
+        Uses a small ``max_tighten_factor`` so the goal is reachable within a
+        single call's search range; with the default cap (0.5) this archive
+        would legitimately return the capped floor instead.
+        """
         kfn = self._gaussian_kernel()
         sched = QuantileScheduler(
             initial_tol=1.0,
@@ -1238,27 +1243,29 @@ class TestKernelAwareBisection:
             kernel_aware=True,
             kernel_fn=kfn,
             ess_target=0.8,
+            max_tighten_factor=0.01,
         )
         inds = self._converged_archive(n=30, scale=0.1)
         eps_aware = sched.compute(inds, 1.0)
-        # Manually compute relative ESS at the bisected ε.
+        # Manually compute relative ESS at the returned ε.
         weights = np.ones(len(inds))
         losses = np.array([ind.loss for ind in inds])
         rel_ess = sched._relative_ess(weights, losses, kfn, eps_aware)
-        # Bisection tolerance default 1e-4; allow 1e-3 for assertion slack.
-        assert abs(rel_ess - 0.8) < 1e-3 or eps_aware == 1.0
+        # Refinement tolerance default 1e-4; allow slack for grid resolution.
+        assert abs(rel_ess - 0.8) < 1e-2 or eps_aware == 1.0
 
     def test_bisection_lower_target_yields_tighter_eps(self):
-        """Lower ess_target ⇒ bisection accepts a tighter ε."""
+        """Lower ess_target ⇒ the search accepts a tighter ε (cap loosened so
+        both targets are reachable within one call)."""
         kfn = self._gaussian_kernel()
         inds = self._converged_archive(n=30, scale=0.1)
         eps_high = QuantileScheduler(
             initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
-            kernel_aware=True, kernel_fn=kfn, ess_target=0.95,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.95, max_tighten_factor=0.01,
         ).compute(inds, 1.0)
         eps_low = QuantileScheduler(
             initial_tol=1.0, population_size=5, additional_needed_inds=0, percentile=50.0,
-            kernel_aware=True, kernel_fn=kfn, ess_target=0.5,
+            kernel_aware=True, kernel_fn=kfn, ess_target=0.5, max_tighten_factor=0.01,
         ).compute(inds, 1.0)
         # ess_target=0.5 is more aggressive ⇒ smaller ε.
         assert eps_low < eps_high
@@ -1284,8 +1291,60 @@ class TestKernelAwareBisection:
         assert ess_current < 0.95  # the exact stall condition for the old rule
         eps_new = sched._bisect_target_ess(weights, losses, current_tol)
         assert eps_new < current_tol  # ratio rule still tightens — no stall
-        # Tightening never increases the effective sample size.
-        assert sched._relative_ess(weights, losses, kfn, eps_new) <= ess_current + 1e-9
+        # ... but never below the per-call cap (bounded tightening).
+        assert eps_new >= sched.max_tighten_factor * current_tol - 1e-12
+
+    def test_heavy_weight_on_high_loss_is_capped(self):
+        """Regression: ESS(ε) is NOT monotone in ε. With the heavy core weight
+        sitting on the HIGHEST-loss particle (the generic case for heavy-tailed
+        IS weights), tightening first kills the heavy component and *raises*
+        the ESS before concentration brings it down again. The old bisection
+        bracketed across that bump and returned ε ≈ 7e-3 from current_tol=1.0 —
+        a 140× single-call collapse. The capped grid search must stay at or
+        above ``max_tighten_factor · current_tol``."""
+        kfn = self._gaussian_kernel()
+        sched = QuantileScheduler(
+            initial_tol=1.0, population_size=5, additional_needed_inds=0,
+            percentile=50.0, kernel_aware=True, kernel_fn=kfn, ess_target=0.95,
+        )
+        n = 40
+        weights = np.ones(n)
+        losses = np.linspace(0.01, 0.5, n)
+        weights[-1] = 1000.0  # heavy weight on the highest loss → ESS bump
+        current_tol = 1.0
+        # Confirm the premise: the ESS curve has a bump (non-monotone).
+        ess_cur = sched._relative_ess(weights, losses, kfn, current_tol)
+        assert sched._relative_ess(weights, losses, kfn, 0.1) > ess_cur
+        eps_new = sched._bisect_target_ess(weights, losses, current_tol)
+        assert eps_new >= sched.max_tighten_factor * current_tol - 1e-12
+        assert eps_new < current_tol
+
+    def test_tied_losses_tighten_at_bounded_rate(self):
+        """Regression: tied losses (discrete summary statistics) make ESS(ε)
+        flat, so no ε meets the retention goal. The old rule clipped to
+        1e-6 · current_tol — a 10⁶× single-call collapse, repeatable every
+        call. The capped search must return exactly the bounded floor."""
+        kfn = self._gaussian_kernel()
+        for mtf in (0.5, 0.8):
+            sched = QuantileScheduler(
+                initial_tol=1.0, population_size=5, additional_needed_inds=0,
+                percentile=50.0, kernel_aware=True, kernel_fn=kfn,
+                ess_target=0.95, max_tighten_factor=mtf,
+            )
+            n = 40
+            weights = np.ones(n)
+            losses = np.zeros(n)  # all perfect matches → ESS flat in ε
+            current_tol = 1.0
+            eps_new = sched._bisect_target_ess(weights, losses, current_tol)
+            assert eps_new == pytest.approx(mtf * current_tol)
+
+    def test_max_tighten_factor_invalid_raises(self):
+        with pytest.raises(ValueError, match="max_tighten_factor"):
+            QuantileScheduler(1.0, 5, 0, max_tighten_factor=0.0)
+        with pytest.raises(ValueError, match="max_tighten_factor"):
+            QuantileScheduler(1.0, 5, 0, max_tighten_factor=1.0)
+        with pytest.raises(ValueError, match="max_tighten_factor"):
+            ABCPMC(LIMITS, kernel="gaussian", max_tighten_factor=1.5)
 
     def test_bisection_holds_when_too_few_accepted(self):
         """Not enough accepted inds ⇒ no tightening."""

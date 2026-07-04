@@ -359,11 +359,12 @@ class ABCPMC(Propagator):
     For smooth kernels (``"gaussian"`` / ``"epanechnikov"``) the bandwidth
     ``eps`` is selected by the scheduler in its *kernel-aware* mode, which is
     active by default for smooth kernels (``kernel_aware`` is set from the
-    kernel choice). The scheduler chooses ``eps`` by bisection on the
+    kernel choice). The scheduler chooses ``eps`` by a bracketed search on the
     kernel-weighted effective sample size, targeting a fixed per-step ESS
     retention ratio (the Del Moral, Doucet & Jasra 2012 successive-population
-    rule), subject to the monotone-decrease guarantee. The hard kernel
-    retains the loss-quantile / acceptance-rate / geometric-decay rule.
+    rule), subject to the monotone-decrease guarantee and a per-call
+    tightening cap (``max_tighten_factor``). The hard kernel retains the
+    loss-quantile / acceptance-rate / geometric-decay rule.
 
     AMIS reweighting
     ----------------
@@ -411,6 +412,7 @@ class ABCPMC(Propagator):
         amis_snapshots: int = 20,
         amis_interval: Optional[int] = None,
         ess_target: float = 0.95,
+        max_tighten_factor: float = 0.5,
         **kwargs: Union[float, int, str],
     ) -> None:
         """
@@ -463,12 +465,20 @@ class ABCPMC(Propagator):
             to ``k`` so each snapshot represents one archive turnover.
         ess_target : float
             Per-step ESS *retention ratio* for the kernel-aware bandwidth
-            bisection (Del Moral, Doucet & Jasra 2012): each tightening step
+            search (Del Moral, Doucet & Jasra 2012): each tightening step
             picks ε so that ``ESS(ε) ≈ ess_target · ESS(current_tol)``. Active
             only when ``kernel`` is a smooth kernel (``"gaussian"`` or
             ``"epanechnikov"``); ignored for the hard kernel which retains the
             loss-quantile / acceptance-rate / geometric-decay schedule. Must
             lie in ``(0, 1]``; default ``0.95`` (retain 95% of ESS per step).
+        max_tighten_factor : float
+            Per-call tightening cap for the kernel-aware bandwidth search:
+            any proposed ε is floored at ``max_tighten_factor · current_tol``,
+            bounding the worst-case single-call tightening regardless of the
+            shape of the ESS(ε) curve (which is not monotone in general and
+            can be flat, e.g. for tied losses from discrete summary
+            statistics). Must lie in ``(0, 1)``; default ``0.5`` (ε can at
+            most halve per call).
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -492,6 +502,9 @@ class ABCPMC(Propagator):
         if not (0.0 < ess_target <= 1.0):
             raise ValueError("ess_target must be in (0, 1].")
         self.ess_target = float(ess_target)
+        if not (0.0 < max_tighten_factor < 1.0):
+            raise ValueError("max_tighten_factor must be in (0, 1).")
+        self.max_tighten_factor = float(max_tighten_factor)
         self.tolerance_scheduler = create_scheduler(
             scheduler_type,
             tol,
@@ -500,6 +513,7 @@ class ABCPMC(Propagator):
             kernel_aware=self._kernel_aware,
             kernel_fn=self._kernel_fn,
             ess_target=self.ess_target,
+            max_tighten_factor=self.max_tighten_factor,
             **kwargs,
         )
         self.rng_np = np.random.default_rng(
@@ -1078,9 +1092,9 @@ class EpsilonScheduler(ABC):
     Kernel-aware mode
     -----------------
     When ``kernel_aware=True`` and a smooth kernel function is supplied, the
-    scheduler selects ε by bisection on the kernel-weighted effective sample
-    size rather than from raw loss statistics. ``ess_target`` (default 0.95)
-    is the **per-step ESS retention ratio**: at each call the scheduler
+    scheduler selects ε by a bracketed search on the kernel-weighted effective
+    sample size rather than from raw loss statistics. ``ess_target`` (default
+    0.95) is the **per-step ESS retention ratio**: at each call the scheduler
     proposes the largest ε ≤ ``current_tol`` such that
 
         ESS(ε) ≈ ess_target · ESS(current_tol),   ESS(ε) = (Σ w·K_ε)² / Σ(w·K_ε)²
@@ -1093,12 +1107,22 @@ class EpsilonScheduler(ABC):
     guarantees a tightening direction always exists, so the bandwidth keeps
     sharpening instead of stalling once the absolute ESS drops below the floor.
 
+    ESS(ε) is **not monotone in ε** in general: skewed core weights (a heavy
+    importance weight on a high-loss particle — the generic case for
+    heavy-tailed IS weights) put a bump in the curve. The search therefore
+    scans a geometric grid downward from ``current_tol`` and takes the
+    *largest* ε meeting the goal (see :meth:`_bisect_target_ess`), and every
+    proposal is floored at ``max_tighten_factor · current_tol`` so a flat ESS
+    curve (e.g. tied losses from discrete summary statistics) tightens at a
+    bounded rate instead of collapsing.
+
     For the hard kernel or ``kernel_aware=False`` the schedulers retain
     their original loss-quantile / acceptance-rate / geometric-decay
     selection rules.
     """
 
-    # Bisection settings; protected so subclasses can tune them.
+    # Search settings; protected so subclasses can tune them.
+    _ESS_GRID_POINTS = 32  # geometric grid resolution for the downward scan
     _BISECT_ITERATIONS = 32
     _BISECT_TOL = 1e-4  # absolute tolerance on relative ESS
 
@@ -1111,9 +1135,12 @@ class EpsilonScheduler(ABC):
         kernel_aware: bool = False,
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
+        max_tighten_factor: float = 0.5,
     ):
         if not (0.0 < ess_target <= 1.0):
             raise ValueError("ess_target must be in (0, 1].")
+        if not (0.0 < max_tighten_factor < 1.0):
+            raise ValueError("max_tighten_factor must be in (0, 1).")
         self.initial_tol = initial_tol
         self.current_tol = initial_tol  # kept for backward-compat with deprecated update()
         self.population_size = population_size
@@ -1121,6 +1148,7 @@ class EpsilonScheduler(ABC):
         self.kernel_aware = kernel_aware
         self.kernel_fn = kernel_fn
         self.ess_target = float(ess_target)
+        self.max_tighten_factor = float(max_tighten_factor)
 
     # ------------------------------------------------------------------
     # Kernel-aware target-ESS bisection (Del Moral, Doucet & Jasra 2012)
@@ -1165,16 +1193,28 @@ class EpsilonScheduler(ABC):
         This is the Del Moral, Doucet & Jasra 2012 *successive-population* rule:
         pick ε_new so that ``ESS(w·K_{ε_new}) = α · ESS(w·K_{ε_current})`` with
         ``α = ess_target`` (default 0.95), i.e. each step retains a fixed
-        fraction of the current effective sample size.
+        fraction of the current effective sample size. Targeting a *ratio* of
+        the current ESS — rather than an absolute ``ESS/N`` floor — means a
+        tightening direction always exists, so the bandwidth keeps sharpening
+        instead of stalling once the absolute ESS drops below the floor.
 
-        ESS is monotone increasing in ε — a looser bandwidth flattens the kernel
-        weights toward the core weights, a tighter one concentrates them on the
-        lowest-loss particles. Because ``α < 1`` the goal ESS is always strictly
-        below ``ESS(current_tol)``, so a tightening ε always exists. This is the
-        key difference from an *absolute* ESS target (``ESS/N ≈ 0.95``), which
-        stalls permanently for smooth kernels whose ESS at the loose bandwidth is
-        already below the absolute floor — leaving the bandwidth frozen and the
-        posterior unable to sharpen.
+        ESS(ε) is **not monotone in ε** in general. With skewed core weights —
+        a heavy importance weight sitting on a high-loss particle, which is the
+        *generic* case for heavy-tailed IS weights, not a corner — tightening ε
+        first kills the heavy component and *raises* the ESS before the usual
+        concentration on the lowest-loss particles brings it down again. A
+        plain bisection on ``[~0, current_tol]`` brackets across that bump and
+        can land orders of magnitude too tight. The search here instead scans a
+        geometric grid downward from ``current_tol`` and takes the **first
+        (largest) ε whose ESS meets the goal**, then refines by bisection
+        inside that single grid interval, where the crossing is bracketed.
+
+        Every proposal is floored at ``max_tighten_factor · current_tol``. If
+        no grid point above the floor meets the goal — a flat ESS curve, e.g.
+        losses tied at identical values as produced by discrete summary
+        statistics — the floor itself is returned: bounded per-call tightening
+        instead of the unbounded collapse a "maximal tightening" clip would
+        produce.
 
         The ``/N`` in :meth:`_relative_ess` cancels in the ratio, so the relative
         form is used throughout.
@@ -1191,16 +1231,29 @@ class EpsilonScheduler(ABC):
             return current_tol
         ess_goal = self.ess_target * ess_current
 
-        # Lower bound: positive, well below current_tol. Use 1e-6 * current_tol
-        # rather than 0 so the kernel-weight evaluation stays in the smooth
-        # regime even for the Gaussian kernel.
-        low = max(1e-12, 1e-6 * current_tol)
-        high = current_tol
-        # If even the tightest ε retains more ESS than the goal, the goal is
-        # unreachable above `low`; clip to `low` (maximal tightening).
-        if self._relative_ess(weights, losses, kfn, low) >= ess_goal:
-            return low
+        # Per-call tightening cap: never propose below this floor.
+        floor = self.max_tighten_factor * current_tol
 
+        # Downward scan: find the first (largest) grid point meeting the goal.
+        # Invariant: ESS(high) > ess_goal (holds at ε = current_tol since
+        # ess_goal < ess_current).
+        ratio = self.max_tighten_factor ** (1.0 / (self._ESS_GRID_POINTS - 1))
+        high = current_tol
+        bracket_low = None
+        for i in range(1, self._ESS_GRID_POINTS):
+            eps = current_tol * ratio**i
+            if self._relative_ess(weights, losses, kfn, eps) <= ess_goal:
+                bracket_low = eps
+                break
+            high = eps
+        if bracket_low is None:
+            # Even the maximal allowed tightening retains more ESS than the
+            # goal. Tighten at the bounded rate.
+            return floor
+
+        # Refine within the single grid interval [bracket_low, high] where the
+        # crossing is bracketed: ESS(high) > ess_goal >= ESS(bracket_low).
+        low = bracket_low
         for _ in range(self._BISECT_ITERATIONS):
             mid = 0.5 * (low + high)
             ess_mid = self._relative_ess(weights, losses, kfn, mid)
@@ -1319,6 +1372,7 @@ class QuantileScheduler(EpsilonScheduler):
         kernel_aware: bool = False,
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
+        max_tighten_factor: float = 0.5,
     ):
         super().__init__(
             initial_tol,
@@ -1327,6 +1381,7 @@ class QuantileScheduler(EpsilonScheduler):
             kernel_aware=kernel_aware,
             kernel_fn=kernel_fn,
             ess_target=ess_target,
+            max_tighten_factor=max_tighten_factor,
         )
         if not (0 < percentile < 100):
             raise ValueError("Percentile must be between 0 and 100.")
@@ -1380,6 +1435,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
         kernel_aware: bool = False,
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
+        max_tighten_factor: float = 0.5,
     ):
         super().__init__(
             initial_tol,
@@ -1388,6 +1444,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
             kernel_aware=kernel_aware,
             kernel_fn=kernel_fn,
             ess_target=ess_target,
+            max_tighten_factor=max_tighten_factor,
         )
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
@@ -1492,6 +1549,7 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         kernel_aware: bool = False,
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
+        max_tighten_factor: float = 0.5,
     ):
         super().__init__(
             initial_tol,
@@ -1500,6 +1558,7 @@ class AcceptanceRateScheduler(EpsilonScheduler):
             kernel_aware=kernel_aware,
             kernel_fn=kernel_fn,
             ess_target=ess_target,
+            max_tighten_factor=max_tighten_factor,
         )
         if not (0 < low_rate < high_rate < 1):
             raise ValueError("0 < low_rate < high_rate < 1 required.")
@@ -1552,6 +1611,7 @@ def create_scheduler(
     kernel_aware: bool = False,
     kernel_fn: Optional["_Kernel"] = None,
     ess_target: float = 0.95,
+    max_tighten_factor: float = 0.5,
     **kwargs,
 ) -> EpsilonScheduler:
     """
@@ -1578,8 +1638,12 @@ def create_scheduler(
         The smooth ABC kernel used by the propagator. Required for
         ``kernel_aware=True`` bisection; ignored otherwise.
     ess_target : float
-        Target relative ESS for the bisection rule (default 0.95). Must be
-        in ``(0, 1]``.
+        Target relative ESS retention ratio for the kernel-aware search
+        (default 0.95). Must be in ``(0, 1]``.
+    max_tighten_factor : float
+        Per-call tightening cap for the kernel-aware search: any proposed ε
+        is floored at ``max_tighten_factor · current_tol`` (default 0.5).
+        Must be in ``(0, 1)``.
     **kwargs
         Additional parameters passed to the scheduler constructor
         (e.g. ``percentile``, ``decay_factor``, ``low_rate``/``high_rate``).
@@ -1596,7 +1660,10 @@ def create_scheduler(
         raise ValueError(f"Unknown scheduler type '{scheduler_type}'. Valid types: {valid}")
 
     common = dict(
-        kernel_aware=kernel_aware, kernel_fn=kernel_fn, ess_target=ess_target
+        kernel_aware=kernel_aware,
+        kernel_fn=kernel_fn,
+        ess_target=ess_target,
+        max_tighten_factor=max_tighten_factor,
     )
     if st == EpsilonSchedulerType.QUANTILE:
         return QuantileScheduler(
