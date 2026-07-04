@@ -1079,6 +1079,11 @@ class ABCPMC(Propagator):
             Number of past proposals to reconstruct for the cumulative-mixture
             denominator. Defaults to ``amis_snapshots`` — the fixed-S balance
             heuristic, i.e. the (C4) approximation to the full cumulative mixture.
+            Mixture components are weighted by the number of draws they stand in
+            for (draw-proportional deterministic mixture): each snapshot covers
+            its segment of archive-phase draws, the prior component covers the
+            bootstrap draws, floored at half an equal share (``0.5/(m+1)``) so
+            the importance weights stay bounded on the whole box.
 
         Returns
         -------
@@ -1120,6 +1125,7 @@ class ABCPMC(Propagator):
         # call saw (inds[:tau]) at the bandwidth it stamped (inds[tau].tolerance),
         # reusing the live proposal builder so the reconstruction is faithful.
         snapshots = []
+        snap_taus = []
         for tau in picks:
             eps_tau = inds[tau].tolerance
             archive = self._reconstruct_archive(inds[:tau], eps_tau)
@@ -1127,13 +1133,22 @@ class ABCPMC(Propagator):
                 continue
             pos, w, L, lbm = self._build_proposal(archive, eps_tau)
             snapshots.append(_ArchiveSnapshot(pos, w, L, lbm))
+            snap_taus.append(tau)
 
         if not snapshots:
             return positions, np.full(n, 1.0 / n)
 
         # Cumulative proposal mixture q̄, evaluated at EVERY particle (the
-        # retroactive step). A uniform-prior component covers the bootstrap draws
-        # and keeps q̄ strictly positive on the whole box (bounded weights).
+        # retroactive step). The deterministic-mixture balance heuristic (Owen
+        # & Zhou 2000) wants each component weighted by the fraction of draws
+        # it stands in for, so the mixture weights are DRAW-PROPORTIONAL: each
+        # snapshot represents the segment of archive-phase draws from its pick
+        # up to the next surviving pick (the first also covers the draws before
+        # it), and the uniform-prior component represents the bootstrap draws
+        # (``tolerance is None``). The prior mass is floored at ``0.5/(m+1)``
+        # so q̄ stays bounded away from zero relative to the prior everywhere
+        # on the box even for bootstrap-free histories — this keeps the
+        # importance weights bounded (w_i <= 2(m+1) · K before normalisation).
         #
         # Evaluated in CHUNKS over the n history points so peak memory is
         # O(chunk · k) instead of O(n · k). Each snapshot's log_mixture_density
@@ -1144,6 +1159,15 @@ class ABCPMC(Propagator):
         # in the post-run analysis phase. logsumexp is applied per row, so the
         # chunked result is bit-for-bit the same as the unchunked computation.
         m = len(snapshots)
+        arch = np.asarray(archive_idx)
+        # Segment of each archive-phase draw: index of the last surviving
+        # snapshot at or before it (draws before the first pick map to 0).
+        seg = np.searchsorted(np.asarray(snap_taus[1:]), arch, side="right")
+        counts = np.bincount(seg, minlength=m).astype(float)  # sums to len(arch) >= 1
+        n_prior_draws = n - len(archive_idx)
+        w_prior = max(n_prior_draws / n, 0.5 / (m + 1))
+        mix_w = np.append(counts * ((1.0 - w_prior) / counts.sum()), w_prior)
+        log_mix_w = np.log(mix_w)  # all entries > 0 (every segment holds its own pick)
         log_prior = float(np.log(self.prior_density))
         log_kernel = self._kernel_fn.log_weight(losses, eps_final)
         log_w = np.empty(n)
@@ -1153,7 +1177,7 @@ class ABCPMC(Propagator):
             for s, snap in enumerate(snapshots):
                 comp[s] = snap.log_mixture_density(positions[start:stop])
             comp[m] = log_prior
-            log_qbar = logsumexp(comp, axis=0) - np.log(m + 1)
+            log_qbar = logsumexp(comp + log_mix_w[:, None], axis=0)
             log_w[start:stop] = log_prior + log_kernel[start:stop] - log_qbar
         finite = np.isfinite(log_w)
         if not finite.any():

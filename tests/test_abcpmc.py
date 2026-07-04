@@ -1718,6 +1718,80 @@ class TestExtractPosterior:
         np.testing.assert_array_equal(pos_ref, pos_chunk)
         np.testing.assert_array_equal(w_ref, w_chunk)
 
+    def test_prior_mass_tracks_bootstrap_fraction(self):
+        """Draw-proportional q̄ (2b): the prior mixture component carries the
+        bootstrap draw *fraction*, not a fixed 1/(m+1). Doubling the bootstrap
+        draws (identical archive-phase history) raises the prior mass in q̄,
+        which lowers the relative weight of a tail particle (covered only by
+        the prior) against a particle at the archive core. The old
+        equal-weight mixture left this ratio unchanged."""
+        limits = self.LIMITS_1D
+        k = 3
+
+        def bootstrap(n_copies):
+            inds, gen = [], 0
+            for _ in range(n_copies):
+                for x, y in [(0.1, 0.5), (0.5, 0.1), (0.3, 0.7)]:
+                    ind = Individual({"x": x, "y": y}, limits, generation=gen)
+                    ind.loss = 5.0
+                    ind.weight = 1.0
+                    inds.append(ind)
+                    gen += 1
+            return inds
+
+        def archive_phase(base_gen):
+            inds = []
+            for i in range(12):  # low-loss cluster near (0.2, 0.2)
+                ind = Individual(
+                    {"x": 0.2 + 0.005 * i, "y": 0.2 - 0.005 * i}, limits,
+                    tolerance=1.0, generation=base_gen + i,
+                )
+                ind.loss = 0.01 * (i + 1)
+                ind.weight = 1.0
+                inds.append(ind)
+            core = Individual({"x": 0.22, "y": 0.18}, limits, tolerance=1.0,
+                              generation=base_gen + 12)
+            core.loss = 0.05
+            core.weight = 1.0
+            far = Individual({"x": 0.9, "y": 0.9}, limits, tolerance=1.0,
+                             generation=base_gen + 13)
+            far.loss = 0.3
+            far.weight = 1.0
+            return inds + [core, far]
+
+        def tail_to_core_ratio(n_copies):
+            abc = ABCPMC(limits, k=k, tol=1.0, kernel="gaussian",
+                         additional_needed_inds=0, rng=random.Random(0))
+            boot = bootstrap(n_copies)
+            history = boot + archive_phase(len(boot))
+            _, w = abc.extract_posterior(history, eps_final=0.5)
+            return w[-1] / w[-2]  # far (last) vs core (second-to-last)
+
+        assert tail_to_core_ratio(2) < tail_to_core_ratio(1)
+
+    def test_no_bootstrap_history_keeps_prior_floor(self):
+        """2b: with zero bootstrap draws the prior component is floored at
+        half an equal share rather than dropped, keeping q̄ > 0 on the whole
+        box and the importance weights bounded."""
+        limits = self.LIMITS_1D
+        abc = ABCPMC(limits, k=3, tol=1.0, kernel="gaussian",
+                     additional_needed_inds=0, rng=random.Random(0))
+        history = []
+        for i in range(20):
+            ind = Individual({"x": 0.3 + 0.01 * i, "y": 0.5}, limits,
+                             tolerance=1.0, generation=i)
+            ind.loss = 0.02 * (i + 1)
+            ind.weight = 1.0
+            history.append(ind)
+        tail = Individual({"x": 0.95, "y": 0.05}, limits, tolerance=1.0, generation=20)
+        tail.loss = 0.5
+        tail.weight = 1.0
+        history.append(tail)
+        _, w = abc.extract_posterior(history, eps_final=1.0)
+        assert w.sum() == pytest.approx(1.0)
+        assert np.all(np.isfinite(w))
+        assert w[-1] > 0.0  # tail still covered via the floored prior mass
+
     def test_hard_kernel_extraction_runs(self):
         """Hard-kernel extraction produces a valid normalised posterior."""
         abc = ABCPMC(
