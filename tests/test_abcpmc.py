@@ -153,7 +153,6 @@ class TestAcceptanceRateScheduler:
             initial_tol=1.0,
             population_size=5,
             additional_needed_inds=5,
-            low_rate=0.1,
             high_rate=0.3,
             shrink_factor=0.9,
         )
@@ -167,16 +166,16 @@ class TestAcceptanceRateScheduler:
         result = sched.compute(inds, 1.0)
         assert result == pytest.approx(1.0 * 0.9)
 
-    def test_holds_when_below_low_rate(self):
+    def test_holds_when_rate_zero(self):
         sched = self._make_sched()
-        # window=10, 0 accepted → rate=0.0 < low_rate=0.1; scheduler can only hold
+        # window=10, 0 accepted → rate=0.0 <= high_rate; scheduler can only hold
         inds = make_inds([5.0] * 10)
         result = sched.compute(inds, 1.0)
         assert result == pytest.approx(1.0)
 
-    def test_unchanged_in_target_zone(self):
+    def test_unchanged_below_high_rate(self):
         sched = self._make_sched()
-        # window=10, 2 accepted → rate=0.2 ∈ [0.1, 0.3]
+        # window=10, 2 accepted → rate=0.2 <= high_rate=0.3
         inds = make_inds([0.5, 0.5] + [5.0] * 8)
         result = sched.compute(inds, 1.0)
         assert result == pytest.approx(1.0)
@@ -188,7 +187,12 @@ class TestAcceptanceRateScheduler:
 
     def test_invalid_rates_raise(self):
         with pytest.raises(ValueError):
-            AcceptanceRateScheduler(1.0, 5, 5, low_rate=0.5, high_rate=0.3)
+            AcceptanceRateScheduler(1.0, 5, 5, high_rate=1.5)
+        with pytest.raises(ValueError):
+            AcceptanceRateScheduler(1.0, 5, 5, shrink_factor=0.0)
+        with pytest.raises(TypeError):
+            # Removed parameter must not be silently accepted.
+            AcceptanceRateScheduler(1.0, 5, 5, low_rate=0.1, high_rate=0.3)
 
 
 class TestCreateScheduler:
@@ -617,7 +621,7 @@ class TestABCPMCSchedulerGuard:
         abc = ABCPMC(
             LIMITS, k=5, tol=10.0,
             scheduler_type="acceptance_rate",
-            additional_needed_inds=0, low_rate=0.1, high_rate=0.3, shrink_factor=0.5,
+            additional_needed_inds=0, high_rate=0.3, shrink_factor=0.5,
         )
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(4)]
         child = abc(inds=inds)
@@ -631,7 +635,7 @@ class TestABCPMCSchedulerGuard:
         abc = ABCPMC(
             LIMITS, k=3, tol=10.0,
             scheduler_type="acceptance_rate",
-            additional_needed_inds=0, low_rate=0.01, high_rate=0.99, shrink_factor=0.05,
+            additional_needed_inds=0, high_rate=0.99, shrink_factor=0.05,
         )
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
         with warnings.catch_warnings():
@@ -1506,7 +1510,7 @@ class TestKernelAwareBisection:
         for st, extra in (
             ("quantile", {"percentile": 50.0}),
             ("geometric_decay", {"decay_factor": 0.9}),
-            ("acceptance_rate", {"low_rate": 0.1, "high_rate": 0.3, "shrink_factor": 0.9}),
+            ("acceptance_rate", {"high_rate": 0.3, "shrink_factor": 0.9}),
         ):
             sched = create_scheduler(
                 st, 1.0, 5, 0, kernel_aware=True, kernel_fn=kfn, ess_target=0.9, **extra

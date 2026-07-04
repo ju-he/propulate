@@ -524,7 +524,7 @@ class ABCPMC(Propagator):
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
-            decay, ``low_rate``/``high_rate`` for acceptance rate).
+            decay, ``high_rate``/``shrink_factor`` for acceptance rate).
 
         Raises
         ------
@@ -1690,17 +1690,18 @@ class AcceptanceRateScheduler(EpsilonScheduler):
 
     The window size is ``population_size + additional_needed_inds``.  If the
     most recent window contains more accepted individuals than ``high_rate``
-    allows, the tolerance is tightened by ``shrink_factor``.  When the
-    acceptance rate is below ``low_rate`` the scheduler holds the current
-    tolerance unchanged.
+    allows, the tolerance is tightened by ``shrink_factor``; otherwise it is
+    held unchanged.
 
     .. note::
         Tolerance expansion is architecturally impossible in this design: the
         monotone guarantee in ``ABCPMC.__call__`` clips any proposed value
-        above ``tol_from_history`` to ``tol_from_history``.  An ``expand_factor``
-        parameter was previously present but removed because it was silently
-        discarded on every call.  If the acceptance rate drops too low, the
-        algorithm holds the tolerance and waits for more accepted individuals.
+        above ``tol_from_history`` to ``tol_from_history``.  ``expand_factor``
+        and ``low_rate`` parameters were previously present but removed
+        because they never had any effect (expansion was silently discarded;
+        rates below ``low_rate`` behaved identically to holding).  If the
+        acceptance rate drops too low, the algorithm holds the tolerance and
+        waits for more accepted individuals.
     """
 
     def __init__(
@@ -1708,7 +1709,6 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         initial_tol: float,
         population_size: int,
         additional_needed_inds: int,
-        low_rate: float = 0.1,
         high_rate: float = 0.3,
         shrink_factor: float = 0.9,
         *,
@@ -1726,9 +1726,10 @@ class AcceptanceRateScheduler(EpsilonScheduler):
             ess_target=ess_target,
             max_tighten_factor=max_tighten_factor,
         )
-        if not (0 < low_rate < high_rate < 1):
-            raise ValueError("0 < low_rate < high_rate < 1 required.")
-        self.low_rate = low_rate
+        if not (0 < high_rate < 1):
+            raise ValueError("0 < high_rate < 1 required.")
+        if not (0 < shrink_factor < 1):
+            raise ValueError("0 < shrink_factor < 1 required.")
         self.high_rate = high_rate
         self.shrink_factor = shrink_factor
 
@@ -1812,7 +1813,7 @@ def create_scheduler(
         Must be in ``(0, 1)``.
     **kwargs
         Additional parameters passed to the scheduler constructor
-        (e.g. ``percentile``, ``decay_factor``, ``low_rate``/``high_rate``).
+        (e.g. ``percentile``, ``decay_factor``, ``high_rate``/``shrink_factor``).
 
     Returns
     -------
