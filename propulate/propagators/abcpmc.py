@@ -505,17 +505,36 @@ class ABCPMC(Propagator):
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
             decay, ``low_rate``/``high_rate`` for acceptance rate).
+
+        Raises
+        ------
+        ValueError
+            On invalid configuration: non-float limits, ``lo >= hi`` for any
+            dimension, ``k < 1``, ``tol <= 0``, ``perturbation_scale <= 0``,
+            ``additional_needed_inds < 0``, ``min_tol < 0``,
+            ``amis_snapshots < 0``, ``amis_interval < 1``, ``ess_target``
+            outside ``(0, 1]``, or ``max_tighten_factor`` outside ``(0, 1)``.
+            Additionally raised from ``__call__`` when an individual carries a
+            negative or NaN loss (ABC requires a nonnegative discrepancy).
         """
         super().__init__(-1, 1, rng=rng)
         self.limits = limits
+        if perturbation_scale <= 0.0:
+            raise ValueError("perturbation_scale must be > 0.")
         self.perturbation_scale = perturbation_scale
+        if k < 1:
+            raise ValueError("k (archive size) must be >= 1.")
         self.k = k
+        if tol <= 0.0:
+            raise ValueError("tol (initial tolerance/bandwidth) must be > 0.")
         self.tol = tol  # read-only initial tolerance; never mutated
         if min_tol is not None and min_tol < 0:
             raise ValueError("min_tol must be >= 0.")
         self.min_tol = min_tol
         if additional_needed_inds is None:
             self.additional_needed_inds = k
+        elif additional_needed_inds < 0:
+            raise ValueError("additional_needed_inds must be >= 0.")
         else:
             self.additional_needed_inds = additional_needed_inds
         self.kernel_name = kernel
@@ -545,6 +564,8 @@ class ABCPMC(Propagator):
         float_limits = {key: v for key, v in self.limits.items() if isinstance(v[0], (float, np.floating))}
         if len(float_limits) != len(self.limits):
             raise ValueError("ABCPMC requires all search-space limits to be continuous (float) intervals.")
+        if any(hi <= lo for lo, hi in float_limits.values()):
+            raise ValueError("ABCPMC limits must satisfy lo < hi for every dimension.")
         volumes = [hi - lo for lo, hi in float_limits.values()]
         self.prior_density = 1.0 / float(np.prod(volumes))
         # Constant box bounds, used by the proposal build and box-mass correction.
@@ -559,6 +580,8 @@ class ABCPMC(Propagator):
         if amis_snapshots < 0:
             raise ValueError("amis_snapshots must be >= 0.")
         self._amis_snapshots = amis_snapshots
+        if amis_interval is not None and amis_interval < 1:
+            raise ValueError("amis_interval must be >= 1.")
         self._amis_interval = amis_interval if amis_interval is not None else max(1, self.k)
         self._snapshots: deque = deque(maxlen=amis_snapshots) if amis_snapshots > 0 else deque(maxlen=1)
         self._calls_since_snapshot = 0
@@ -566,6 +589,24 @@ class ABCPMC(Propagator):
         # One-shot warning flags (set on first emission).
         self._warned_none: bool = False
         self._warned_zero_weight: bool = False
+
+    @staticmethod
+    def _check_loss(ind: Individual) -> None:
+        """Reject losses outside ABC semantics.
+
+        ABC interprets the loss as a nonnegative discrepancy
+        ``rho(simulated, observed)``; every kernel, the quantile schedule and
+        the ESS search silently misbehave on signed losses, so fail fast.
+        ``inf`` is allowed (a failed simulation is an infinitely bad
+        discrepancy); NaN and negative values are not.
+        """
+        loss = ind.loss
+        if loss != loss or loss < 0.0:  # NaN or negative
+            raise ValueError(
+                f"ABCPMC received an individual with loss={loss}. ABC requires the "
+                "loss to be a nonnegative discrepancy rho(simulated, observed); "
+                "shift or redefine your distance function so that rho >= 0."
+            )
 
     def _update_cache(self, inds: List[Individual]) -> None:
         """Incrementally update the internal performance cache.
@@ -601,11 +642,14 @@ class ABCPMC(Propagator):
                 # extract_posterior — so this only affects proposal quality.)
                 self._snapshots.clear()
                 self._calls_since_snapshot = 0
+            for ind in inds:
+                self._check_loss(ind)
             self._cache.rebuild(inds, self.tol)
             self.tolerance_scheduler.reset_cache()
         elif n > cached_len:
             # Pure append — process the new tail incrementally.
             for new_ind in inds[cached_len:]:
+                self._check_loss(new_ind)
                 self._cache.update(new_ind)
         # n == cached_len and prefix intact: genuinely no change.
 

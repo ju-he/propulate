@@ -447,6 +447,60 @@ class TestABCPMCEdgeCases:
             assert np.isfinite(child.weight)
 
 
+class TestABCPMCValidation:
+    """Constructor and loss validation (1d)."""
+
+    def test_invalid_k_raises(self):
+        with pytest.raises(ValueError, match="k"):
+            ABCPMC(LIMITS, k=0)
+
+    def test_invalid_tol_raises(self):
+        with pytest.raises(ValueError, match="tol"):
+            ABCPMC(LIMITS, tol=0.0)
+        with pytest.raises(ValueError, match="tol"):
+            ABCPMC(LIMITS, tol=-1.0)
+
+    def test_invalid_perturbation_scale_raises(self):
+        with pytest.raises(ValueError, match="perturbation_scale"):
+            ABCPMC(LIMITS, perturbation_scale=0.0)
+
+    def test_negative_additional_needed_inds_raises(self):
+        with pytest.raises(ValueError, match="additional_needed_inds"):
+            ABCPMC(LIMITS, additional_needed_inds=-1)
+
+    def test_inverted_limits_raise(self):
+        with pytest.raises(ValueError, match="lo < hi"):
+            ABCPMC({"x": (1.0, 0.0), "y": (0.0, 1.0)})
+
+    def test_invalid_amis_interval_raises(self):
+        with pytest.raises(ValueError, match="amis_interval"):
+            ABCPMC(LIMITS, amis_interval=0)
+
+    def test_negative_loss_raises(self):
+        """ABC semantics need rho >= 0; kernels/quantiles/ESS silently
+        misbehave on signed losses, so the propagator must fail fast."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        inds = [
+            make_ind(loss=1.0, tolerance=10.0),
+            make_ind(loss=-0.5, tolerance=10.0, generation=1),
+        ]
+        with pytest.raises(ValueError, match="nonnegative"):
+            abc(inds=inds)
+
+    def test_nan_loss_raises(self):
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        inds = [make_ind(loss=float("nan"), tolerance=10.0)]
+        with pytest.raises(ValueError, match="nonnegative"):
+            abc(inds=inds)
+
+    def test_inf_loss_allowed(self):
+        """inf = failed simulation = infinitely bad discrepancy: valid."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        inds = [make_ind(loss=float("inf"), tolerance=10.0)]
+        child = abc(inds=inds)
+        assert child is not None
+
+
 class TestW1LogSpaceAMIS:
     """W1.1 — log-space AMIS assembly stability at higher d."""
 
