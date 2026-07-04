@@ -18,6 +18,7 @@ The fabricated workload approximates a mid-run snapshot:
 from __future__ import annotations
 
 import cProfile
+import os
 import pstats
 import random
 import time
@@ -150,6 +151,12 @@ def order_sensitivity_experiment(n: int = 2000, k: int = 50, window: int = 20, s
 def main() -> None:
     print("ABCPMC __call__ microbenchmark")
     print("=" * 70)
+    if os.environ.get("OMP_NUM_THREADS") != "1":
+        print(
+            "WARNING: OMP_NUM_THREADS != 1. Multi-threaded BLAS spin-waits on the\n"
+            "tiny per-call triangular solves and can inflate timings ~30x; run with\n"
+            "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 for representative numbers.\n"
+        )
     limits, initial_tol, inds = make_workload()
     print(
         f"Workload: d={len(limits)}, history={len(inds)}, accepted~5000, rejected~200, "

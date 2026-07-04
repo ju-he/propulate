@@ -446,6 +446,16 @@ class ABCPMC(Propagator):
     The kernel factor ``K_eps(rho)`` is applied at use time, so changing eps
     reweights the archive without re-evaluating the simulator.
 
+    Performance note (BLAS threading)
+    ---------------------------------
+    The per-call hot path works on tiny matrices (``d × d`` triangular
+    solves, ``k``-component mixtures), where multi-threaded BLAS is pure
+    overhead: with default OpenBLAS/MKL settings the thread pool spin-waits
+    on every ``solve_triangular`` call (observed: ~30× per-call slowdown at
+    ``d = 2`` on a 12-core node). Pin BLAS to one thread per process
+    (``OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1``) — for MPI runs with one
+    worker per rank this is standard practice anyway.
+
     See Also
     --------
     :class:`Propagator` : The parent class.
@@ -471,6 +481,7 @@ class ABCPMC(Propagator):
         amis_interval: Optional[int] = None,
         ess_target: float = 0.95,
         max_tighten_factor: float = 0.5,
+        bisect_interval: Optional[int] = None,
         **kwargs: Union[float, int, str],
     ) -> None:
         """
@@ -550,6 +561,15 @@ class ABCPMC(Propagator):
             can be flat, e.g. for tied losses from discrete summary
             statistics). Must lie in ``(0, 1)``; default ``0.5`` (ε can at
             most halve per call).
+        bisect_interval : int, optional
+            Number of ``__call__`` invocations between kernel-aware ESS
+            searches. The search costs O(n_accepted) per evaluation, so
+            running it every call would make the otherwise O(log n) hot path
+            linear in the accepted count; in between, the last proposal is
+            held (bounded staleness — tightening is only delayed, never
+            reversed, thanks to the monotone guarantee). Defaults to ``k``,
+            matching one archive turnover. Only affects the cached scheduler
+            path; the pure ``compute`` reference path is never throttled.
         **kwargs
             Additional parameters forwarded to the scheduler constructor
             (e.g. ``percentile`` for quantile, ``decay_factor`` for geometric
@@ -562,7 +582,8 @@ class ABCPMC(Propagator):
             dimension, ``k < 1``, ``tol <= 0``, ``perturbation_scale <= 0``,
             ``additional_needed_inds < 0``, ``min_tol < 0``,
             ``amis_snapshots < 0``, ``amis_interval < 1``, ``ess_target``
-            outside ``(0, 1]``, or ``max_tighten_factor`` outside ``(0, 1)``.
+            outside ``(0, 1]``, ``max_tighten_factor`` outside ``(0, 1)``, or
+            ``bisect_interval < 1``.
             Additionally raised from ``__call__`` when an individual carries a
             negative or NaN loss (ABC requires a nonnegative discrepancy).
         """
@@ -595,6 +616,8 @@ class ABCPMC(Propagator):
         if not (0.0 < max_tighten_factor < 1.0):
             raise ValueError("max_tighten_factor must be in (0, 1).")
         self.max_tighten_factor = float(max_tighten_factor)
+        if bisect_interval is not None and bisect_interval < 1:
+            raise ValueError("bisect_interval must be >= 1.")
         self.tolerance_scheduler = create_scheduler(
             scheduler_type,
             tol,
@@ -604,6 +627,7 @@ class ABCPMC(Propagator):
             kernel_fn=self._kernel_fn,
             ess_target=self.ess_target,
             max_tighten_factor=self.max_tighten_factor,
+            bisect_interval=bisect_interval,
             **kwargs,
         )
         self.rng_np = np.random.default_rng(
@@ -1279,8 +1303,12 @@ class EpsilonScheduler(ABC):
     No mutable state should be modified by ``compute``; all scheduling logic
     must be derivable from ``inds`` alone. Subclasses may additionally
     override ``compute_cached(...)`` to exploit append-only history with
-    internal performance caches, but that cached path must remain equivalent
-    to ``compute(...)`` for valid inputs.
+    internal performance caches; that cached path must remain equivalent
+    to ``compute(...)`` for valid inputs, **modulo bounded staleness** on the
+    kernel-aware path: the ESS search runs only every ``bisect_interval``
+    cached calls with the last proposal held in between, so ``compute_cached``
+    may lag ``compute`` by up to ``bisect_interval`` calls (never violating
+    monotonicity — the caller clips).
 
     Kernel-aware mode
     -----------------
@@ -1340,11 +1368,14 @@ class EpsilonScheduler(ABC):
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
         max_tighten_factor: float = 0.5,
+        bisect_interval: Optional[int] = None,
     ):
         if not (0.0 < ess_target <= 1.0):
             raise ValueError("ess_target must be in (0, 1].")
         if not (0.0 < max_tighten_factor < 1.0):
             raise ValueError("max_tighten_factor must be in (0, 1).")
+        if bisect_interval is not None and bisect_interval < 1:
+            raise ValueError("bisect_interval must be >= 1.")
         self.initial_tol = initial_tol
         self.current_tol = initial_tol  # kept for backward-compat with deprecated update()
         self.population_size = population_size
@@ -1353,6 +1384,11 @@ class EpsilonScheduler(ABC):
         self.kernel_fn = kernel_fn
         self.ess_target = float(ess_target)
         self.max_tighten_factor = float(max_tighten_factor)
+        # Kernel-aware throttle (cached path only): run the O(n_accepted) ESS
+        # search every `bisect_interval` calls, hold the last proposal between.
+        self._bisect_interval = bisect_interval if bisect_interval is not None else max(1, population_size)
+        self._calls_since_bisect = 0
+        self._held_eps: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Kernel-aware target-ESS bisection (Del Moral, Doucet & Jasra 2012)
@@ -1491,6 +1527,28 @@ class EpsilonScheduler(ABC):
         )
         return self._bisect_target_ess(weights, losses, current_tol)
 
+    def _kernel_aware_throttled(self, current_tol: float, gather) -> float:
+        """Throttled kernel-aware dispatch for the cached path.
+
+        The ESS search costs O(n_accepted) per evaluation (the ``gather``
+        materialisation plus up to ``_ESS_GRID_POINTS + _BISECT_ITERATIONS``
+        logsumexp passes), which would make the otherwise O(log n) hot path
+        linear in the accepted count on *every* call. Run the search only
+        every ``bisect_interval`` calls and hold the last proposal in between.
+        Staleness only *delays* tightening by at most ``bisect_interval``
+        calls — a held (possibly looser) value is safe under the monotone
+        clip in ``ABCPMC.__call__`` — and ``gather`` is invoked only on
+        refresh. The uncached :meth:`compute` reference path is never
+        throttled, so it remains a pure function of history.
+        """
+        self._calls_since_bisect += 1
+        if self._held_eps is not None and self._calls_since_bisect < self._bisect_interval:
+            return self._held_eps
+        self._calls_since_bisect = 0
+        eps = self._kernel_aware_from_accepted(current_tol, gather())
+        self._held_eps = eps
+        return eps
+
     @abstractmethod
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         """
@@ -1530,7 +1588,8 @@ class EpsilonScheduler(ABC):
 
     def reset_cache(self) -> None:
         """Reset internal performance caches (called on full history rebuild)."""
-        pass
+        self._calls_since_bisect = 0
+        self._held_eps = None
 
     def update(
         self,
@@ -1577,6 +1636,7 @@ class QuantileScheduler(EpsilonScheduler):
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
         max_tighten_factor: float = 0.5,
+        bisect_interval: Optional[int] = None,
     ):
         super().__init__(
             initial_tol,
@@ -1586,6 +1646,7 @@ class QuantileScheduler(EpsilonScheduler):
             kernel_fn=kernel_fn,
             ess_target=ess_target,
             max_tighten_factor=max_tighten_factor,
+            bisect_interval=bisect_interval,
         )
         if not (0 < percentile < 100):
             raise ValueError("Percentile must be between 0 and 100.")
@@ -1603,9 +1664,10 @@ class QuantileScheduler(EpsilonScheduler):
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
         if self._use_kernel_aware():
-            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
-            accepted = list(accepted_by_loss[:n_accepted])
-            return self._kernel_aware_from_accepted(current_tol, accepted)
+            return self._kernel_aware_throttled(
+                current_tol,
+                lambda: list(accepted_by_loss[: accepted_by_loss.bisect_key_left(current_tol)]),
+            )
         n = accepted_by_loss.bisect_key_left(current_tol)
         if n < self.population_size + self.additional_needed_inds:
             return current_tol
@@ -1640,6 +1702,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
         max_tighten_factor: float = 0.5,
+        bisect_interval: Optional[int] = None,
     ):
         super().__init__(
             initial_tol,
@@ -1649,6 +1712,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
             kernel_fn=kernel_fn,
             ess_target=ess_target,
             max_tighten_factor=max_tighten_factor,
+            bisect_interval=bisect_interval,
         )
         if not (0 < decay_factor < 1):
             raise ValueError("Decay factor must be between 0 and 1.")
@@ -1700,9 +1764,10 @@ class GeometricDecayScheduler(EpsilonScheduler):
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
         if self._use_kernel_aware():
-            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
-            accepted = list(accepted_by_loss[:n_accepted])
-            return self._kernel_aware_from_accepted(current_tol, accepted)
+            return self._kernel_aware_throttled(
+                current_tol,
+                lambda: list(accepted_by_loss[: accepted_by_loss.bisect_key_left(current_tol)]),
+            )
         batch_size = self.population_size + self.additional_needed_inds
         tol = self._cached_tol
         consumed = self._cached_consumed
@@ -1718,6 +1783,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
         return tol
 
     def reset_cache(self) -> None:
+        super().reset_cache()
         self._cached_consumed = 0
         self._cached_tol = self.initial_tol
 
@@ -1754,6 +1820,7 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         kernel_fn: Optional["_Kernel"] = None,
         ess_target: float = 0.95,
         max_tighten_factor: float = 0.5,
+        bisect_interval: Optional[int] = None,
     ):
         super().__init__(
             initial_tol,
@@ -1763,6 +1830,7 @@ class AcceptanceRateScheduler(EpsilonScheduler):
             kernel_fn=kernel_fn,
             ess_target=ess_target,
             max_tighten_factor=max_tighten_factor,
+            bisect_interval=bisect_interval,
         )
         if not (0 < high_rate < 1):
             raise ValueError("0 < high_rate < 1 required.")
@@ -1787,9 +1855,10 @@ class AcceptanceRateScheduler(EpsilonScheduler):
 
     def compute_cached(self, inds, current_tol, accepted_by_loss, inds_by_gen, accepted_by_gen):
         if self._use_kernel_aware():
-            n_accepted = accepted_by_loss.bisect_key_left(current_tol)
-            accepted = list(accepted_by_loss[:n_accepted])
-            return self._kernel_aware_from_accepted(current_tol, accepted)
+            return self._kernel_aware_throttled(
+                current_tol,
+                lambda: list(accepted_by_loss[: accepted_by_loss.bisect_key_left(current_tol)]),
+            )
         window_size = self.population_size + self.additional_needed_inds
         if len(inds_by_gen) < window_size:
             return current_tol
@@ -1817,6 +1886,7 @@ def create_scheduler(
     kernel_fn: Optional["_Kernel"] = None,
     ess_target: float = 0.95,
     max_tighten_factor: float = 0.5,
+    bisect_interval: Optional[int] = None,
     **kwargs,
 ) -> EpsilonScheduler:
     """
@@ -1849,6 +1919,10 @@ def create_scheduler(
         Per-call tightening cap for the kernel-aware search: any proposed ε
         is floored at ``max_tighten_factor · current_tol`` (default 0.5).
         Must be in ``(0, 1)``.
+    bisect_interval : int, optional
+        Calls between kernel-aware ESS searches on the cached path; the last
+        proposal is held in between (bounded staleness). Defaults to
+        ``population_size``. Must be ``>= 1``.
     **kwargs
         Additional parameters passed to the scheduler constructor
         (e.g. ``percentile``, ``decay_factor``, ``high_rate``/``shrink_factor``).
@@ -1869,6 +1943,7 @@ def create_scheduler(
         kernel_fn=kernel_fn,
         ess_target=ess_target,
         max_tighten_factor=max_tighten_factor,
+        bisect_interval=bisect_interval,
     )
     if st == EpsilonSchedulerType.QUANTILE:
         return QuantileScheduler(

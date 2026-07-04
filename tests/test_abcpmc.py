@@ -1634,6 +1634,104 @@ class TestKernelAwareBisection:
             ABCPMC(LIMITS, ess_target=0.0)
 
 
+class TestKernelAwareThrottle:
+    """Phase 4: the cached kernel-aware path runs the O(n_accepted) ESS
+    search only every ``bisect_interval`` calls, holding the last proposal in
+    between. Staleness only delays tightening (the monotone clip makes a held
+    value safe); the pure ``compute`` reference path is never throttled."""
+
+    def _drive(self, abc, n):
+        history = []
+        for i in range(n):
+            child = abc(history)
+            child.loss = abs(float(child.position[0]) - 0.5)
+            child.generation = i
+            history.append(child)
+
+    def _count_searches(self, abc, n):
+        sched = abc.tolerance_scheduler
+        calls = {"n": 0}
+        orig = sched._kernel_aware_from_accepted
+
+        def counting(current_tol, accepted):
+            calls["n"] += 1
+            return orig(current_tol, accepted)
+
+        sched._kernel_aware_from_accepted = counting
+        self._drive(abc, n)
+        return calls["n"]
+
+    def test_interval_defaults_to_k(self):
+        abc = ABCPMC(LIMITS, k=7, tol=1.0, kernel="gaussian")
+        assert abc.tolerance_scheduler._bisect_interval == 7
+
+    def test_refresh_count_bounded(self):
+        abc = ABCPMC(LIMITS, k=5, tol=1.0, kernel="gaussian",
+                     additional_needed_inds=0, rng=random.Random(0))
+        n_calls = 60
+        searches = self._count_searches(abc, n_calls)
+        # ~55 post-bootstrap scheduler calls; interval 5 → ~11 refreshes.
+        assert 0 < searches <= n_calls // 5 + 2
+
+    def test_interval_one_refreshes_every_call(self):
+        abc = ABCPMC(LIMITS, k=5, tol=1.0, kernel="gaussian",
+                     additional_needed_inds=0, bisect_interval=1,
+                     rng=random.Random(0))
+        searches = self._count_searches(abc, 60)
+        assert searches >= 50  # every post-bootstrap call refreshes
+
+    def test_refresh_point_equality_and_holding(self):
+        """At refresh points the throttled scheduler equals an unthrottled
+        one on the same state; between refreshes it returns the held value."""
+        from sortedcontainers import SortedKeyList
+
+        from propulate.propagators.abcpmc import _GaussianKernel
+
+        kfn = _GaussianKernel()
+
+        def mk(interval):
+            return QuantileScheduler(
+                1.0, 5, 0, percentile=50.0, kernel_aware=True, kernel_fn=kfn,
+                ess_target=0.9, bisect_interval=interval,
+            )
+
+        throttled, fresh = mk(3), mk(1)
+        rng = np.random.default_rng(0)
+        inds = make_inds([float(x) for x in np.abs(rng.normal(0.0, 0.1, size=9))])
+        by_loss = SortedKeyList(key=lambda i: i.loss)
+        res_t, res_f = [], []
+        for ind in inds:
+            by_loss.add(ind)
+            lst = list(by_loss)
+            res_t.append(throttled.compute_cached(lst, 1.0, by_loss, by_loss, by_loss))
+            res_f.append(fresh.compute_cached(lst, 1.0, by_loss, by_loss, by_loss))
+        for i in (0, 3, 6):  # refresh points for interval=3
+            assert res_t[i] == pytest.approx(res_f[i])
+        assert res_t[1] == res_t[0] and res_t[2] == res_t[0]  # held
+        assert res_t[4] == res_t[3] and res_t[5] == res_t[3]
+
+    def test_reset_cache_forces_refresh(self):
+        """A history rebuild (reset_cache) must clear the held value so the
+        next call recomputes from the new history."""
+        from propulate.propagators.abcpmc import _GaussianKernel
+
+        sched = QuantileScheduler(
+            1.0, 5, 0, percentile=50.0, kernel_aware=True,
+            kernel_fn=_GaussianKernel(), bisect_interval=10,
+        )
+        sched._held_eps = 0.123
+        sched._calls_since_bisect = 1
+        sched.reset_cache()
+        assert sched._held_eps is None
+        assert sched._calls_since_bisect == 0
+
+    def test_invalid_bisect_interval_raises(self):
+        with pytest.raises(ValueError, match="bisect_interval"):
+            ABCPMC(LIMITS, kernel="gaussian", bisect_interval=0)
+        with pytest.raises(ValueError, match="bisect_interval"):
+            QuantileScheduler(1.0, 5, 0, bisect_interval=0)
+
+
 class TestTruncationCorrection:
     """Truncated-proposal density correction (R4): per-component in-box mass."""
 
