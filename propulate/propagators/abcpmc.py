@@ -213,6 +213,21 @@ class _ArchiveSnapshot:
         return logsumexp(log_pdfs + log_w[None, :], axis=1)  # (n,)
 
 
+def _gen_order(ind: "Individual") -> tuple:
+    """Total generation order: ``(generation, island, rank)``.
+
+    Generations collide across workers (every rank counts 0, 1, 2, ...), so a
+    bare ``generation`` key leaves the order of ties to arrival order, which
+    is rank-dependent under MPI. Breaking ties by ``(island, rank)`` makes
+    every generation-ordered view a deterministic function of the history
+    *set* — identical on every rank — so the epoch structure of
+    :class:`GeometricDecayScheduler` and the sliding window of
+    :class:`AcceptanceRateScheduler` do not depend on message-arrival
+    interleaving, and the cached and uncached scheduler paths agree exactly.
+    """
+    return (ind.generation, ind.island, ind.rank)
+
+
 class _IncrementalCache:
     """
     Performance cache for ``ABCPMC.__call__``.
@@ -240,8 +255,8 @@ class _IncrementalCache:
         self.history_len: int = -1  # sentinel: no history processed yet
         self.tol_from_history: float = initial_tol
         self._accepted_by_loss: SortedKeyList = SortedKeyList(key=lambda ind: ind.loss)
-        self._by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
-        self._accepted_by_gen: SortedKeyList = SortedKeyList(key=lambda ind: ind.generation)
+        self._by_gen: SortedKeyList = SortedKeyList(key=_gen_order)
+        self._accepted_by_gen: SortedKeyList = SortedKeyList(key=_gen_order)
         self._initial_tol: float = initial_tol
         # Identity of the last individual processed, used to verify that the
         # previously-cached prefix is still intact before taking the
@@ -280,11 +295,11 @@ class _IncrementalCache:
         self._accepted_by_loss = SortedKeyList(inds, key=lambda ind: ind.loss)
 
         # All inds sorted by generation
-        self._by_gen = SortedKeyList(inds, key=lambda ind: ind.generation)
+        self._by_gen = SortedKeyList(inds, key=_gen_order)
 
         # Accepted at initial_tol, sorted by generation
         acc_gen = [ind for ind in inds if ind.loss < initial_tol]
-        self._accepted_by_gen = SortedKeyList(acc_gen, key=lambda ind: ind.generation)
+        self._accepted_by_gen = SortedKeyList(acc_gen, key=_gen_order)
 
         self._last_ind = inds[-1] if inds else None
 
@@ -1647,7 +1662,7 @@ class GeometricDecayScheduler(EpsilonScheduler):
         batch_size = self.population_size + self.additional_needed_inds
         accepted_all = sorted(
             [ind for ind in inds if ind.loss < self.initial_tol],
-            key=lambda i: i.generation,
+            key=_gen_order,
         )
         tol = self.initial_tol
         consumed = 0
@@ -1740,7 +1755,7 @@ class AcceptanceRateScheduler(EpsilonScheduler):
         window_size = self.population_size + self.additional_needed_inds
         if len(inds) < window_size:
             return current_tol
-        recent = sorted(inds, key=lambda i: i.generation)[-window_size:]
+        recent = sorted(inds, key=_gen_order)[-window_size:]
         accepted = [i for i in recent if i.loss < current_tol]
         rate = len(accepted) / len(recent)
         if rate > self.high_rate:

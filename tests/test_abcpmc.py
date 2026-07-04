@@ -195,6 +195,54 @@ class TestAcceptanceRateScheduler:
             AcceptanceRateScheduler(1.0, 5, 5, low_rate=0.1, high_rate=0.3)
 
 
+class TestGenerationTieBreaking:
+    """3b: generation ties (the norm under MPI — every rank counts 0,1,2,...)
+    are broken by (island, rank), so generation-ordered views — the epoch
+    structure of GeometricDecayScheduler and the sliding window of
+    AcceptanceRateScheduler — are deterministic functions of the history SET,
+    identical on every rank regardless of message-arrival interleaving."""
+
+    LOSS_TABLE = {
+        (0, 0): 0.5, (0, 1): 0.5,
+        (1, 0): 0.85, (1, 1): 0.95,
+        (2, 0): 0.5, (2, 1): 0.92,
+    }
+
+    def _two_rank_history(self, swap_arrival):
+        """Two workers with colliding generations; arrival interleaving varies."""
+        inds = []
+        for gen in range(3):
+            for rank in ((1, 0) if swap_arrival else (0, 1)):
+                ind = make_ind(loss=self.LOSS_TABLE[(gen, rank)], generation=gen)
+                ind.rank = rank
+                ind.island = 0
+                inds.append(ind)
+        return inds
+
+    def test_geometric_decay_arrival_order_invariant(self):
+        """Epoch batches must not depend on the tie order: with a bare
+        generation key, the swapped arrival puts the loss-0.95 individual into
+        the first batch and blocks the first decay (1.0 instead of 0.9)."""
+        tols = []
+        for swap in (False, True):
+            sched = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+            tols.append(sched.compute(self._two_rank_history(swap), 1.0))
+        assert tols[0] == pytest.approx(tols[1])
+        assert tols[0] == pytest.approx(0.9)
+
+    def test_acceptance_rate_arrival_order_invariant(self):
+        """The sliding window cuts inside a generation tie group (window=3 on
+        3 generations x 2 ranks): with a bare generation key the swapped
+        arrival swaps which gen-1 individual falls inside the window and flips
+        the tighten/hold decision."""
+        results = []
+        for swap in (False, True):
+            sched = AcceptanceRateScheduler(1.0, 2, 1, high_rate=0.4, shrink_factor=0.9)
+            results.append(sched.compute(self._two_rank_history(swap), 0.9))
+        assert results[0] == pytest.approx(results[1])
+        assert results[0] == pytest.approx(0.9)  # rate 1/3 < 0.4 → hold
+
+
 class TestCreateScheduler:
     def test_create_quantile(self):
         sched = create_scheduler("quantile", 10.0, 5, 0, percentile=40.0)
