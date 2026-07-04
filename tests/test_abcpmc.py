@@ -337,6 +337,24 @@ class TestABCPMCEdgeCases:
         child = abc(inds=inds)  # must not raise
         assert child is not None
 
+    def test_jitter_does_not_swamp_converged_archive(self):
+        """Scale-aware jitter (1c): for a tightly-converged archive (posterior
+        std ~1e-4) the proposal covariance must track the archive covariance.
+        The old absolute 1e-6*I jitter dominated such archives (~6x inflated
+        proposal std here), permanently capping proposal sharpness."""
+        abc = ABCPMC(LIMITS, k=5, tol=10.0, rng=random.Random(0))
+        archive = []
+        for i in range(5):
+            pos = {"x": 0.5 + 1e-4 * i, "y": 0.5 - 1e-4 * i}
+            ind = Individual(pos, LIMITS, tolerance=10.0, generation=i)
+            ind.loss = 0.1 * (i + 1)
+            ind.weight = 1.0
+            archive.append(ind)
+        _, _, L, _ = abc._build_proposal(archive, 10.0)
+        marginal_std = np.sqrt(np.diag(L @ L.T))
+        assert marginal_std.max() < 5e-4  # tracks the ~1e-4 archive scale
+        assert marginal_std.min() > 1e-5  # ...without collapsing to zero
+
     def test_child_is_individual(self):
         abc = ABCPMC(LIMITS, k=3, tol=10.0)
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]

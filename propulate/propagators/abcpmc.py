@@ -550,6 +550,9 @@ class ABCPMC(Propagator):
         # Constant box bounds, used by the proposal build and box-mass correction.
         self._lo = np.array([lim[0] for lim in self.limits.values()], dtype=float)
         self._hi = np.array([lim[1] for lim in self.limits.values()], dtype=float)
+        # Mean squared box width; sets the absolute floor of the scale-aware
+        # covariance jitter in _build_proposal.
+        self._mean_box_sq = float(np.mean((self._hi - self._lo) ** 2))
         self._cache = _IncrementalCache(self.tol)
 
         # AMIS snapshot ring buffer (performance state, not algorithmic state).
@@ -741,13 +744,22 @@ class ABCPMC(Propagator):
 
         positions = np.stack([ind.position for ind in archive])
         cov = self.weighted_covariance(positions, weights)
-        cov += 1e-6 * np.eye(positions.shape[1])
+        d = positions.shape[1]
+        # Scale-aware jitter: proportional to the mean marginal variance of the
+        # archive so that a tightly-converged posterior (std ~1e-4 → var ~1e-8)
+        # is not swamped — an absolute 1e-6*I floor would dominate such an
+        # archive and permanently cap proposal sharpness. The box-scale term
+        # keeps the matrix factorable for a degenerate archive (all positions
+        # identical → zero covariance) at a negligible ~1e-6 · box-width
+        # perturbation scale.
+        jitter = 1e-9 * max(float(np.trace(cov)), 0.0) / d + 1e-12 * self._mean_box_sq
+        cov += jitter * np.eye(d)
         kernel_cov = self.perturbation_scale * cov
         kernel_cov = 0.5 * (kernel_cov + kernel_cov.T)
         try:
             L = np.linalg.cholesky(kernel_cov)
         except np.linalg.LinAlgError:
-            kernel_cov += 1e-7 * np.eye(positions.shape[1])
+            kernel_cov += (1e3 * jitter) * np.eye(d)
             L = np.linalg.cholesky(kernel_cov)
         # Per-component in-box mass log Z_j (candidate-independent; computed once
         # per proposal, never per candidate — see _log_box_mass).
