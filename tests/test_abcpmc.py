@@ -437,7 +437,8 @@ class TestABCPMCEdgeCases:
             ind.loss = 0.1 * (i + 1)
             ind.weight = 1.0
             archive.append(ind)
-        _, _, L, _ = abc._build_proposal(archive, 10.0)
+        proposal = abc._build_proposal(archive, 10.0)
+        L = proposal.L
         marginal_std = np.sqrt(np.diag(L @ L.T))
         assert marginal_std.max() < 5e-4  # tracks the ~1e-4 archive scale
         assert marginal_std.min() > 1e-5  # ...without collapsing to zero
@@ -744,21 +745,25 @@ class TestW1RetryExhaustion:
     """W1.3 — reject-and-resample-parent retry replaces the 1e12 weight floor."""
 
     def test_partial_retry_then_success_yields_normal_weight(self, monkeypatch):
-        """If the first call underflows but a subsequent retry succeeds, weight is normal (not 0, not 1e12)."""
+        """If the first retry's denominator underflows but a subsequent retry
+        succeeds, the weight is normal (not 0, not 1e12). The per-retry
+        denominator evaluation is ``log_component_terms`` (the per-candidate
+        ``solve_triangular`` was hoisted into the proposal build), so the
+        one-shot underflow is injected there."""
         from propulate.propagators import abcpmc as mod
         abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
         inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
 
-        real_solve = mod.solve_triangular
+        orig_terms = mod._ArchiveSnapshot.log_component_terms
         call_count = {"n": 0}
 
-        def underflow_then_real(L, b, lower=True):
+        def underflow_then_real(self, theta):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return np.full_like(b, 1e8, dtype=float)  # underflow once
-            return real_solve(L, b, lower=lower)
+                return np.full(self.mu_w.shape[0], -np.inf)  # underflow once
+            return orig_terms(self, theta)
 
-        monkeypatch.setattr(mod, "solve_triangular", underflow_then_real)
+        monkeypatch.setattr(mod._ArchiveSnapshot, "log_component_terms", underflow_then_real)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", RuntimeWarning)
             child = abc(inds=inds)
@@ -1805,6 +1810,81 @@ class TestKernelAwareThrottle:
             QuantileScheduler(1.0, 5, 0, bisect_interval=0)
 
 
+class TestProposalMemo:
+    """Second pass (efficiency): the live proposal is memoised on
+    (archive identity, effective bandwidth), and the density fast path built
+    on precomputed whitened means must match a dense reference computation."""
+
+    def _counting_build(self, abc):
+        calls = {"n": 0}
+        orig = abc._build_proposal
+
+        def counting(archive, eps):
+            calls["n"] += 1
+            return orig(archive, eps)
+
+        abc._build_proposal = counting
+        return calls
+
+    def test_unchanged_archive_reuses_proposal(self):
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
+        calls = self._counting_build(abc)
+        for _ in range(10):
+            abc(inds=inds)  # identical archive + bandwidth every call
+        assert calls["n"] == 1
+
+    def test_archive_change_rebuilds(self):
+        abc = ABCPMC(LIMITS, k=3, tol=10.0, rng=random.Random(0))
+        inds = [make_ind(loss=float(i + 1), tolerance=10.0, generation=i) for i in range(5)]
+        abc(inds=inds)  # prime the memo
+        calls = self._counting_build(abc)
+        better = make_ind(loss=0.5, tolerance=10.0, generation=5)  # enters top-3
+        inds.append(better)
+        abc(inds=inds)
+        assert calls["n"] == 1
+
+    def test_density_fast_path_matches_dense_reference(self):
+        """log_pdf / log_component_terms / log_mixture_density (whitened-mean
+        fast path with the explicit triangular inverse) must match a dense
+        per-component multivariate-normal evaluation."""
+        from scipy.special import logsumexp as lse
+
+        from propulate.propagators.abcpmc import _ArchiveSnapshot
+
+        rng = np.random.default_rng(0)
+        k, d = 6, 3
+        positions = rng.uniform(0.2, 0.8, size=(k, d))
+        weights = rng.uniform(0.1, 1.0, size=k)
+        weights[2] = 0.0  # zero-weight component must drop out (-inf term)
+        weights /= weights.sum()
+        A = rng.normal(size=(d, d))
+        cov = A @ A.T + 0.5 * np.eye(d)
+        L = np.linalg.cholesky(cov)
+        log_box_mass = rng.uniform(-0.2, 0.0, size=k)
+        snap = _ArchiveSnapshot(positions, weights, L, log_box_mass)
+
+        cov_inv = np.linalg.inv(cov)
+        log_det = float(np.linalg.slogdet(cov)[1])
+        with np.errstate(divide="ignore"):
+            log_w = np.where(weights > 0, np.log(np.where(weights > 0, weights, 1.0)), -np.inf)
+
+        thetas = rng.uniform(0.0, 1.0, size=(4, d))
+        ref_mix = []
+        for theta in thetas:
+            diffs = theta - positions
+            maha = np.einsum("ij,jk,ik->i", diffs, cov_inv, diffs)
+            log_pdfs = -0.5 * (d * np.log(2 * np.pi) + log_det + maha) - log_box_mass
+            np.testing.assert_allclose(snap.log_pdf(theta), log_pdfs, rtol=1e-9)
+            ref_terms = log_w + log_pdfs
+            fast_terms = snap.log_component_terms(theta)
+            finite = np.isfinite(ref_terms)
+            np.testing.assert_allclose(fast_terms[finite], ref_terms[finite], rtol=1e-9)
+            assert np.all(np.isneginf(fast_terms[~finite]))
+            ref_mix.append(lse(ref_terms))
+        np.testing.assert_allclose(snap.log_mixture_density(thetas), ref_mix, rtol=1e-9)
+
+
 class TestTruncationCorrection:
     """Truncated-proposal density correction (R4): per-component in-box mass."""
 
@@ -1879,8 +1959,20 @@ class TestTruncationCorrection:
 
         monkeypatch.setattr(mod, "ndtr", counting_ndtr)
         abc(history)
-        # _log_box_mass invokes ndtr exactly twice (z_hi, z_lo) for the single
-        # current proposal; snapshots reuse their stored log_box_mass.
+        # _log_box_mass invokes ndtr exactly twice (z_hi, z_lo) when the
+        # current proposal is (re)built — and zero times when the proposal
+        # memo cache hits (unchanged archive + bandwidth). Snapshots always
+        # reuse their stored log_box_mass.
+        assert calls["n"] in (0, 2)
+
+        # Force a rebuild: a new individual entering the top-k changes the
+        # archive fingerprint → exactly one fresh box-mass computation.
+        calls["n"] = 0
+        best = Individual({"x": 0.31, "y": 0.52}, LIMITS, tolerance=None, generation=20)
+        best.loss = 0.0
+        best.weight = 1.0
+        history.append(best)
+        abc(history)
         assert calls["n"] == 2
 
 

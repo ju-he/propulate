@@ -104,23 +104,6 @@ def _make_kernel(name: str) -> _Kernel:
         )
 
 
-def _log_mixture(weights: np.ndarray, log_pdfs: np.ndarray) -> float:
-    """
-    Log of a categorical mixture density: log(sum_j w_j * exp(log_pdf_j)).
-
-    Computed in log-space via logsumexp to avoid underflow when log_pdfs
-    span many decades (Gaussian kernel in d >= 10 with tight Sigma).
-
-    Zero weights are mapped to -inf log-weight so they drop out of the sum.
-    Returns -inf if all log-weights are -inf (e.g. empty support).
-    """
-    weights = np.asarray(weights, dtype=float)
-    log_pdfs = np.asarray(log_pdfs, dtype=float)
-    with np.errstate(divide="ignore"):
-        log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
-    return float(logsumexp(log_w + log_pdfs))
-
-
 def _log_box_mass(
     positions: np.ndarray, sigma: np.ndarray, lo: np.ndarray, hi: np.ndarray
 ) -> np.ndarray:
@@ -158,16 +141,31 @@ _EXTRACT_POSTERIOR_CHUNK = 65_536
 
 
 class _ArchiveSnapshot:
-    """Frozen view of the proposal distribution used at one past call.
+    """Frozen view of the proposal distribution used at one call.
 
-    Stores enough state to evaluate the past proposal density q_tau(theta) at
-    any new theta: archive positions, normalised mixture weights, the Cholesky
-    factor of the perturbation covariance, and the precomputed per-component
-    in-box mass ``log Z_j`` (which is independent of the query point, so it is
-    computed once at snapshot creation rather than per candidate).
+    Stores the raw mixture description (archive positions, normalised mixture
+    weights, the Cholesky factor of the perturbation covariance, and the
+    per-component in-box mass ``log Z_j``) plus derived quantities precomputed
+    **once at construction** so that density evaluation on the per-``__call__``
+    hot path is pure NumPy:
+
+    - ``L_inv`` — explicit inverse of the triangular factor. Whitening becomes
+      a small matmul instead of a LAPACK ``trtrs`` call per query; scipy's
+      ``solve_triangular`` wrapper overhead (validation, ``asarray_chkfinite``)
+      dominates at the tiny ``d`` encountered here. The factor is jittered SPD
+      (see ``_build_proposal``), so the explicit triangular inverse is
+      well-conditioned for density evaluation.
+    - ``mu_w`` — whitened component means ``L⁻¹ μ_j``, shape ``(k, d)``.
+    - ``log_comp_const`` — per-component constant
+      ``log w_j + log_norm − log Z_j`` (−inf for zero-weight components), so
+      ``log(w_j · N_j(θ)) = log_comp_const_j − ½‖L⁻¹θ − mu_w_j‖²`` and a full
+      mixture density is a single logsumexp over these terms.
     """
 
-    __slots__ = ("positions", "weights", "L", "log_norm", "log_box_mass")
+    __slots__ = (
+        "positions", "weights", "L", "log_norm", "log_box_mass",
+        "L_inv", "mu_w", "log_comp_const",
+    )
 
     def __init__(
         self,
@@ -182,35 +180,48 @@ class _ArchiveSnapshot:
         self.log_box_mass = log_box_mass
         d = positions.shape[1]
         self.log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
+        self.L_inv = solve_triangular(L, np.eye(d), lower=True)  # (d, d)
+        self.mu_w = positions @ self.L_inv.T  # (k, d) whitened means
+        with np.errstate(divide="ignore"):
+            log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
+        self.log_comp_const = log_w + self.log_norm - log_box_mass  # (k,)
+
+    def log_component_terms(self, theta: np.ndarray) -> np.ndarray:
+        """``log(w_j · N_j(theta))`` per component, shape ``(k,)``.
+
+        Pure NumPy (one small matmul + one einsum); the hot-path building
+        block for the balance-heuristic denominator — the mixture-of-mixtures
+        over [current proposal + snapshots] flattens into one logsumexp over
+        the concatenated component terms.
+        """
+        theta_w = self.L_inv @ theta  # (d,)
+        diff = self.mu_w - theta_w  # (k, d)
+        return self.log_comp_const - 0.5 * np.einsum("ij,ij->i", diff, diff)
 
     def log_pdf(self, theta: np.ndarray) -> np.ndarray:
         """Log-PDF of each truncated mixture component at theta. Shape: (k,)."""
-        diffs = theta - self.positions  # (k, d)
-        z = solve_triangular(self.L, diffs.T, lower=True)  # (d, k)
-        return self.log_norm - 0.5 * np.einsum("ij,ij->j", z, z) - self.log_box_mass
+        theta_w = self.L_inv @ theta
+        diff = self.mu_w - theta_w
+        return self.log_norm - 0.5 * np.einsum("ij,ij->i", diff, diff) - self.log_box_mass
 
     def log_mixture_density(self, thetas: np.ndarray) -> np.ndarray:
         """Log mixture density ``log q(theta)`` for a batch of points.
 
         Vectorised over a ``(n, d)`` batch, returning ``(n,)``. All components
         share the covariance ``L Lᵀ``, so the Mahalanobis distance equals the
-        Euclidean distance after whitening — whiten once and form pairwise
-        squared distances, rather than a triangular solve per (point, component).
-        Used by :meth:`ABCPMC.extract_posterior` for the retroactive reweighting.
+        Euclidean distance after whitening; the whitened means and combined
+        per-component constants are precomputed at construction, so a batch
+        costs one ``(n, d) @ (d, d)`` whitening matmul plus the ``(n, k)``
+        distance matrix. Used by :meth:`ABCPMC.extract_posterior` for the
+        retroactive reweighting (called once per chunk — no per-chunk solves).
         """
-        theta_w = solve_triangular(self.L, thetas.T, lower=True).T  # (n, d)
-        mu_w = solve_triangular(self.L, self.positions.T, lower=True).T  # (k, d)
+        theta_w = thetas @ self.L_inv.T  # (n, d)
         sq = (
             (theta_w ** 2).sum(1)[:, None]
-            + (mu_w ** 2).sum(1)[None, :]
-            - 2.0 * theta_w @ mu_w.T
+            + (self.mu_w ** 2).sum(1)[None, :]
+            - 2.0 * theta_w @ self.mu_w.T
         )  # (n, k) squared Mahalanobis distances
-        log_pdfs = self.log_norm - 0.5 * sq - self.log_box_mass[None, :]  # (n, k)
-        with np.errstate(divide="ignore"):
-            log_w = np.where(
-                self.weights > 0.0, np.log(np.where(self.weights > 0.0, self.weights, 1.0)), -np.inf
-            )
-        return logsumexp(log_pdfs + log_w[None, :], axis=1)  # (n,)
+        return logsumexp(self.log_comp_const[None, :] - 0.5 * sq, axis=1)  # (n,)
 
 
 def _gen_order(ind: "Individual") -> tuple:
@@ -677,6 +688,10 @@ class ABCPMC(Propagator):
         # covariance jitter in _build_proposal.
         self._mean_box_sq = float(np.mean((self._hi - self._lo) ** 2))
         self._cache = _IncrementalCache(self._tol_fallback)
+        # Live-proposal memo: (effective_tol, archive ids, proposal, cdf,
+        # archive refs). See _get_proposal. Never needs invalidation beyond
+        # key mismatch — the proposal is a pure function of the key.
+        self._proposal_cache: Optional[tuple] = None
 
         # AMIS snapshot ring buffer (performance state, not algorithmic state).
         if amis_snapshots < 0:
@@ -838,24 +853,21 @@ class ABCPMC(Propagator):
         cov = wd.T @ diffs
         return factor * cov
 
-    def _build_proposal(self, archive: List[Individual], effective_tol: float):
+    def _build_proposal(self, archive: List[Individual], effective_tol: float) -> _ArchiveSnapshot:
         """Build the truncated Gaussian-mixture proposal density from an archive.
 
         Pure function of ``(archive, effective_tol)``. Shared by :meth:`__call__`
-        (the live proposal) and :meth:`extract_posterior` (history replay) so the
-        reconstructed proposal sequence matches the one actually used. Computes the
-        effective mixture weights ``∝ stored_weight · K_eps(loss)`` in log-space,
-        the perturbation Cholesky factor, and the per-component in-box mass.
+        (the live proposal, memoised via :meth:`_get_proposal`) and
+        :meth:`extract_posterior` (history replay) so the reconstructed proposal
+        sequence matches the one actually used. Computes the effective mixture
+        weights ``∝ stored_weight · K_eps(loss)`` in log-space, the perturbation
+        Cholesky factor, and the per-component in-box mass.
 
         Returns
         -------
-        positions : np.ndarray, shape (k, d)
-        weights : np.ndarray, shape (k,)
-            Normalised mixture weights.
-        L : np.ndarray, shape (d, d)
-            Cholesky factor of the perturbation covariance.
-        log_box_mass : np.ndarray, shape (k,)
-            Per-component ``log Z_j`` truncation constant.
+        _ArchiveSnapshot
+            The proposal with all density-evaluation precomputes (whitened
+            means, combined per-component log-constants, inverse factor).
         """
         if any(ind.weight is None for ind in archive):
             if not self._warned_none:
@@ -917,7 +929,34 @@ class ABCPMC(Propagator):
         # per proposal, never per candidate — see _log_box_mass).
         sigma = np.sqrt(np.diag(kernel_cov))
         log_box_mass = _log_box_mass(positions, sigma, self._lo, self._hi)
-        return positions, weights, L, log_box_mass
+        return _ArchiveSnapshot(positions, weights, L, log_box_mass)
+
+    def _get_proposal(self, archive: List[Individual], effective_tol: float) -> _ArchiveSnapshot:
+        """Memoised :meth:`_build_proposal` for the live proposal.
+
+        The proposal is a pure function of ``(archive, effective_tol)``, and at
+        steady state consecutive calls see the identical archive and bandwidth
+        — the top-k changes only when a better individual arrives and the
+        bandwidth only on a (throttled) scheduler tightening — so rebuilding
+        the covariance + Cholesky + box mass every call (~40% of hard-kernel
+        call time) is wasted. Cache the last build keyed on the archive
+        members' identities and the bandwidth. The cache entry holds the
+        archive list itself, so the member ids cannot be recycled while the
+        fingerprint is alive; a stale entry can never alias a different
+        archive. Parent-selection state (the weight CDF) lives alongside.
+        """
+        key_ids = tuple(map(id, archive))
+        cached = self._proposal_cache
+        if (
+            cached is not None
+            and cached[0] == effective_tol
+            and cached[1] == key_ids
+        ):
+            return cached[2]
+        proposal = self._build_proposal(archive, effective_tol)
+        cdf = np.cumsum(proposal.weights)
+        self._proposal_cache = (effective_tol, key_ids, proposal, cdf, archive)
+        return proposal
 
     def _initial_bandwidth_from_history(self) -> Optional[float]:
         """Data-driven initial bandwidth for ``tol=None`` (smooth kernels).
@@ -1035,11 +1074,13 @@ class ABCPMC(Propagator):
             child.weight = 1.0
             return child
 
-        # 6+7. Build the truncated Gaussian-mixture proposal from the archive
-        #      (effective weights, perturbation Cholesky, per-component in-box
-        #      mass). Shared with extract_posterior so the reconstructed proposal
-        #      sequence matches the one used live.
-        positions, weights, L, log_box_mass = self._build_proposal(archive, effective_tol)
+        # 6+7. Build (or reuse) the truncated Gaussian-mixture proposal for
+        #      this (archive, bandwidth). Memoised — see _get_proposal; shared
+        #      with extract_posterior so the reconstructed proposal sequence
+        #      matches the one used live.
+        proposal = self._get_proposal(archive, effective_tol)
+        cdf = self._proposal_cache[3]  # parent-selection weight CDF, cached alongside
+        L = proposal.L
 
         # 7+8. Sample candidate and assign its importance weight.
         #
@@ -1051,7 +1092,7 @@ class ABCPMC(Propagator):
         # which drops out of weighted_covariance and resampling.
         lo = self._lo
         hi = self._hi
-        d = positions.shape[1]
+        d = proposal.positions.shape[1]
         BATCH = 16
         log_min = np.log(self._MIN_DENOM)
 
@@ -1061,8 +1102,11 @@ class ABCPMC(Propagator):
         weight_ok = False
 
         for retry in range(self._MAX_WEIGHT_RETRIES):
-            # Parent selection + batched reject-resample inside the box.
-            idx = int(self.rng_np.choice(len(archive), p=weights))
+            # Parent selection via the cached weight CDF (inverse-CDF draw —
+            # avoids Generator.choice's per-call O(k) validation of p), then
+            # batched reject-resample inside the box.
+            u = self.rng_np.random() * cdf[-1]
+            idx = min(int(np.searchsorted(cdf, u, side="right")), len(archive) - 1)
             parent = archive[idx]
             candidate_pos = parent.position
             found = False
@@ -1090,25 +1134,18 @@ class ABCPMC(Propagator):
                 weight_ok = True
                 break
 
-            # Balance-heuristic (AMIS) denominator in log-space. logsumexp
-            # keeps the mixture stable when Gaussian-kernel PDFs span many
-            # decades (typical in d >= 10).
-            diffs = candidate_pos - positions
-            z_solve = solve_triangular(L, diffs.T, lower=True)
-            log_norm = -0.5 * d * np.log(2.0 * np.pi) - np.log(np.diag(L)).sum()
-            log_pdfs = log_norm - 0.5 * np.einsum("ij,ij->j", z_solve, z_solve) - log_box_mass
-            log_current = _log_mixture(weights, log_pdfs)
-
-            if self._amis_snapshots > 0 and len(self._snapshots) > 0:
-                log_mixtures = [log_current]
-                for snap in self._snapshots:
-                    snap_log_pdfs = snap.log_pdf(candidate_pos)
-                    log_mixtures.append(_log_mixture(snap.weights, snap_log_pdfs))
-                log_denom = float(logsumexp(np.asarray(log_mixtures))) - np.log(
-                    1.0 + len(self._snapshots)
-                )
-            else:
-                log_denom = log_current
+            # Balance-heuristic (AMIS) denominator in log-space. The mixture
+            # of mixtures over [current proposal + snapshots] flattens into a
+            # SINGLE logsumexp over all component terms (the equal 1/(S+1)
+            # outer weights factor out as a constant): one scipy call instead
+            # of one per snapshot, and each term set is pure NumPy against
+            # the snapshot's precomputed whitened means. logsumexp keeps the
+            # mixture stable when Gaussian-kernel PDFs span many decades
+            # (typical in d >= 10).
+            terms = [proposal.log_component_terms(candidate_pos)]
+            for snap in self._snapshots:
+                terms.append(snap.log_component_terms(candidate_pos))
+            log_denom = float(logsumexp(np.concatenate(terms))) - np.log(len(terms))
 
             if np.isfinite(log_denom) and log_denom >= log_min:
                 weight_ok = True
@@ -1138,15 +1175,12 @@ class ABCPMC(Propagator):
             child.weight = 0.0
 
         # 9. Snapshot the current proposal for future AMIS denominators. The
-        #    per-component in-box mass is the same one used for this call's
-        #    denominator, so it is reused rather than recomputed.
+        #    proposal object is immutable by convention (every consumer is
+        #    read-only), so the ring buffer shares it with the memo cache —
+        #    no copies; all precomputes come along for free.
         self._calls_since_snapshot += 1
         if self._amis_snapshots > 0 and self._calls_since_snapshot >= self._amis_interval:
-            self._snapshots.append(
-                _ArchiveSnapshot(
-                    positions.copy(), weights.copy(), L.copy(), log_box_mass.copy()
-                )
-            )
+            self._snapshots.append(proposal)
             self._calls_since_snapshot = 0
 
         return child
@@ -1299,8 +1333,7 @@ class ABCPMC(Propagator):
             archive = self._reconstruct_archive(inds[:tau], eps_tau)
             if archive is None:
                 continue
-            pos, w, L, lbm = self._build_proposal(archive, eps_tau)
-            snapshots.append(_ArchiveSnapshot(pos, w, L, lbm))
+            snapshots.append(self._build_proposal(archive, eps_tau))
             snap_taus.append(tau)
 
         if not snapshots:
