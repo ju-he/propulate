@@ -1,6 +1,7 @@
 import pathlib
 import random
 
+import numpy as np
 from mpi4py import MPI
 
 from propulate import Propulator
@@ -36,11 +37,22 @@ if __name__ == "__main__":
     rng = random.Random(config.seed + comm.rank)  # Separate random number generator for optimization.
     function, limits = get_function_search_space(config.function)  # Get callable function + search-space limits.
 
-    # Randomly choose a start point from within the limits.
-    # low = np.array([v[0] for v in limits.values()])
-    # high = np.array([v[1] for v in limits.values()])
-    # start_point = np.random.default_rng(seed=config.seed + 235231).uniform(low=low, high=high)
-    propagator = ABCPMC(limits=limits)
+    # ABC-PMC propagator in posterior mode: smooth Gaussian kernel with a
+    # data-driven initial bandwidth (tol=None, the default) and the
+    # PMC-optimal perturbation scale (~2x the weighted archive covariance,
+    # Beaumont et al. 2009). The default perturbation_scale=0.8 is narrower
+    # and optimisation-leaning — use it if you only want a best fit; sweep it
+    # for posterior-quality work.
+    #
+    # NOTE: pass a rank-offset rng so proposal sampling is reproducible under
+    # a fixed --seed; without it the proposal stream is seeded from OS
+    # entropy and runs are not repeatable.
+    propagator = ABCPMC(
+        limits=limits,
+        kernel="gaussian",
+        perturbation_scale=2.0,
+        rng=random.Random(config.seed + comm.rank),
+    )
     # Set up Propulator performing actual optimization.
     propulator = Propulator(
         loss_fn=function,
@@ -54,3 +66,16 @@ if __name__ == "__main__":
     # Run optimization and print summary of results.
     propulator.propulate(logging_interval=config.logging_interval, debug=config.verbosity)
     propulator.summarize(top_n=config.top_n, debug=config.verbosity)
+
+    # Posterior extraction (analysis phase — run once, after the loop): the
+    # retroactive AMIS estimator reweights every evaluated individual against
+    # the reconstructed proposal mixture. The weight/tolerance stamps travel
+    # with the individuals, so any rank's population copy works.
+    if comm.rank == 0:
+        positions, weights = propagator.extract_posterior(propulator.population)
+        posterior_mean = np.average(positions, axis=0, weights=weights)
+        ess = 1.0 / float(np.sum(weights**2))
+        print(f"Posterior mean: {dict(zip(limits.keys(), (float(x) for x in posterior_mean)))}")
+        print(f"Posterior ESS : {ess:.1f} of {len(weights)} particles")
+        np.save(f"{config.checkpoint}/abc_posterior_positions.npy", positions)
+        np.save(f"{config.checkpoint}/abc_posterior_weights.npy", weights)
