@@ -785,16 +785,42 @@ class TestCacheInvalidation:
         assert abc._cache.history_len == 5
         assert abc._cache.tol_from_history == 2.0  # from e
 
+        sched = abc.tolerance_scheduler
+        rebuilds = {"n": 0}
+        orig_reset = sched.reset_cache  # reset_cache is called only on the rebuild branch
+
+        def counting_reset():
+            rebuilds["n"] += 1
+            orig_reset()
+
+        sched.reset_cache = counting_reset
+
         # Migration: e emigrates (removed), immigrant f arrives (appended).
         # Length is unchanged (5), but the last element is now f, not e.
         f = make_ind(loss=2.5, tolerance=5.0, generation=5)
         swapped = [a, b, c, d, f]
         abc(inds=swapped)
         assert abc._cache._last_ind is f
-        # A stale (no-op) cache would keep tol_from_history == 2.0 (e's value);
-        # the running min only ever decreases on the incremental path. A rebuild
-        # recomputes it from the new content → 5.0, proving the rebuild fired.
-        assert abc._cache.tol_from_history == 5.0
+        assert rebuilds["n"] == 1  # the tail-identity check fired a rebuild
+        # The emigrant e still exists on its destination island; the effective
+        # bandwidth stays monotone across the rebuild instead of loosening to
+        # the surviving minimum (5.0).
+        assert abc._cache.tol_from_history == 2.0
+
+    def test_rebuild_does_not_loosen_tolerance_on_shrink(self):
+        """Migration (1b): when the sole carrier of the tightest stamped
+        tolerance is deactivated (active list shrinks), the rebuild keeps the
+        running-min tolerance instead of loosening to the surviving minimum —
+        the monotone-decrease guarantee must hold across migration events."""
+        abc = ABCPMC(LIMITS, k=3, tol=10.0)
+        inds = [make_ind(loss=float(i + 1), tolerance=5.0, generation=i) for i in range(6)]
+        carrier = make_ind(loss=0.5, tolerance=0.2, generation=6)
+        inds.append(carrier)
+        abc(inds=inds)
+        assert abc._cache.tol_from_history == pytest.approx(0.2)
+        migrated = [ind for ind in inds if ind is not carrier]  # shrink → rebuild
+        abc(inds=migrated)
+        assert abc._cache.tol_from_history == pytest.approx(0.2)
 
     def test_append_only_does_not_rebuild(self):
         """R6 perf guard: pure-append growth must stay on the incremental path

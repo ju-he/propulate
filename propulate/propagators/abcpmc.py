@@ -251,13 +251,30 @@ class _IncrementalCache:
     # -- full rebuild (fallback) -----------------------------------------------
 
     def rebuild(self, inds, initial_tol: float) -> None:
-        """Reconstruct all cached state from scratch.  O(N log N)."""
+        """Reconstruct all cached state from scratch.  O(N log N).
+
+        ``tol_from_history`` is kept **monotone across rebuilds** within the
+        lifetime of this cache: rebuilds are triggered by island migration,
+        where an emigrant is *deactivated* on the source island but continues
+        to exist on its destination — if that emigrant was the sole carrier of
+        the tightest stamped tolerance, recomputing the minimum from the
+        remaining active history alone would silently *loosen* the effective
+        bandwidth. Taking ``min(previous, min over new history)`` preserves
+        the monotone-decrease guarantee across migration events.
+
+        Trade-off: after a crash/restart the cache is a fresh instance, so the
+        tolerance reconstructs from the checkpointed history alone and may
+        transiently loosen if the min-carrier had emigrated — consistent with
+        the "no persisted algorithmic state" design; the next archive-phase
+        breed restamps a tightened tolerance.
+        """
         self._initial_tol = initial_tol
         self.history_len = len(inds)
 
-        # tol_from_history
+        # tol_from_history: running minimum, monotone across rebuilds.
         tols = [ind.tolerance for ind in inds if ind.tolerance is not None]
-        self.tol_from_history = min(tols) if tols else initial_tol
+        new_min = min(tols) if tols else initial_tol
+        self.tol_from_history = min(self.tol_from_history, new_min)
 
         # All inds sorted by loss for tolerance-threshold queries.
         self._accepted_by_loss = SortedKeyList(inds, key=lambda ind: ind.loss)
@@ -318,7 +335,12 @@ class ABCPMC(Propagator):
     -----------------------------------------
     The algorithm is stateless w.r.t. its algorithmic state: the effective
     bandwidth and the active archive are reconstructed from the evaluated-history
-    list ``inds`` on every ``__call__``. The posterior the paper reports is
+    list ``inds`` on every ``__call__``. One qualification: the effective
+    bandwidth is additionally kept *monotone across migration-induced cache
+    rebuilds* within the propagator's lifetime, because migration deactivates
+    emigrants — if the sole carrier of the tightest stamped tolerance
+    emigrates, a pure reconstruction from the remaining active history would
+    loosen the bandwidth (see :meth:`_IncrementalCache.rebuild`). The posterior the paper reports is
     :meth:`extract_posterior`, which is a **pure function of the history** — it
     replays the proposal sequence deterministically — so it is identical whether
     computed in one run or after a crash/restart with an empty buffer. That is
