@@ -557,11 +557,11 @@ class TestABCPMCValidation:
 
     def test_inverted_limits_raise(self):
         with pytest.raises(ValueError, match="lo < hi"):
-            ABCPMC({"x": (1.0, 0.0), "y": (0.0, 1.0)})
+            ABCPMC({"x": (1.0, 0.0), "y": (0.0, 1.0)}, tol=1.0)
 
     def test_invalid_amis_interval_raises(self):
         with pytest.raises(ValueError, match="amis_interval"):
-            ABCPMC(LIMITS, amis_interval=0)
+            ABCPMC(LIMITS, tol=1.0, amis_interval=0)
 
     def test_negative_loss_raises(self):
         """ABC semantics need rho >= 0; kernels/quantiles/ESS silently
@@ -586,6 +586,79 @@ class TestABCPMCValidation:
         inds = [make_ind(loss=float("inf"), tolerance=10.0)]
         child = abc(inds=inds)
         assert child is not None
+
+
+class TestDataDrivenTol:
+    """5a: tol=None (smooth kernels) derives the initial bandwidth from the
+    bootstrap losses — median of the first k finite-loss individuals in
+    generation order, a pure function of the history set."""
+
+    def test_hard_kernel_requires_explicit_tol(self):
+        with pytest.raises(ValueError, match="explicit tol"):
+            ABCPMC(LIMITS)  # kernel defaults to hard
+        with pytest.raises(ValueError, match="explicit tol"):
+            ABCPMC(LIMITS, kernel="hard")
+
+    def test_first_stamped_tolerance_is_bootstrap_median(self):
+        abc = ABCPMC(LIMITS, k=4, kernel="gaussian", additional_needed_inds=0,
+                     rng=random.Random(0))
+        history = []
+        for i, loss in enumerate([0.2, 0.4, 0.6, 0.8]):
+            child = abc(history)
+            assert child.tolerance is None  # still bootstrap
+            child.loss = loss
+            child.generation = i
+            history.append(child)
+        child = abc(history)  # first archive-phase call
+        # eps0 = median([0.2, 0.4, 0.6, 0.8]) = 0.5; with only 2 accepted
+        # below eps0 (< pop+additional = 4) the scheduler holds, so the
+        # stamped tolerance is exactly the data-driven median.
+        assert child.tolerance == pytest.approx(0.5)
+
+    def test_waits_for_finite_losses(self):
+        """All-failed bootstrap sims (inf loss) must extend the prior phase
+        instead of fixing an infinite bandwidth."""
+        abc = ABCPMC(LIMITS, k=3, kernel="gaussian", additional_needed_inds=0,
+                     rng=random.Random(0))
+        history = []
+        for i in range(5):
+            child = abc(history)
+            child.loss = float("inf")
+            child.generation = i
+            history.append(child)
+        child = abc(history)
+        assert child.tolerance is None  # still bootstrap: no finite losses
+
+    def test_restart_reproduces_bandwidth(self):
+        """The data-driven bandwidth is a pure function of history: a fresh
+        propagator (different rng) stamps the same tolerance."""
+        def stamped_tol(seed):
+            abc = ABCPMC(LIMITS, k=4, kernel="gaussian",
+                         additional_needed_inds=0, rng=random.Random(seed))
+            history = []
+            rng_np = np.random.default_rng(7)  # shared loss stream
+            for i in range(4):
+                child = abc(history)
+                child.loss = float(rng_np.uniform(0.1, 0.9))
+                child.generation = i
+                history.append(child)
+            return abc, history
+
+        abc1, hist1 = stamped_tol(0)
+        child1 = abc1(hist1)
+        fresh = ABCPMC(LIMITS, k=4, kernel="gaussian",
+                       additional_needed_inds=0, rng=random.Random(999))
+        # Feed the fresh instance the SAME history (positions differ from its
+        # own rng, but the stamped tolerance depends only on the losses).
+        child2 = fresh(hist1)
+        assert child1.tolerance == pytest.approx(child2.tolerance)
+
+    def test_smooth_kernel_logs_scheduler_override(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="propulate.propagators.abcpmc"):
+            ABCPMC(LIMITS, kernel="gaussian", scheduler_type="quantile")
+        assert "target-ESS" in caplog.text
 
 
 class TestW1LogSpaceAMIS:

@@ -471,7 +471,7 @@ class ABCPMC(Propagator):
         limits: Dict,
         perturbation_scale: float = 0.8,
         k: int = 100,
-        tol: float = 600.0,
+        tol: Optional[float] = None,
         scheduler_type: str = "acceptance_rate",
         additional_needed_inds: Optional[int] = None,
         min_tol: Optional[float] = None,
@@ -502,9 +502,16 @@ class ABCPMC(Propagator):
         k : int
             Archive size: number of accepted individuals used to build the
             mixture proposal.
-        tol : float
+        tol : float, optional
             Initial tolerance / bandwidth. **Never mutated** after
-            construction; serves as the fallback when history is empty.
+            construction. Required (explicit) for the hard kernel. For smooth
+            kernels the default ``None`` selects the bandwidth data-driven:
+            the median loss of the first ``k`` finite-loss individuals in
+            generation order — a pure function of the history set (identical
+            after a crash/restart; rank-invariant given the set thanks to the
+            deterministic generation tie-break). The data-driven value is
+            only consulted until the first stamped tolerance enters the
+            history, after which the running minimum takes over.
         scheduler_type : str
             Bandwidth scheduler. One of ``'quantile'``, ``'geometric_decay'``,
             ``'acceptance_rate'``.
@@ -595,9 +602,6 @@ class ABCPMC(Propagator):
         if k < 1:
             raise ValueError("k (archive size) must be >= 1.")
         self.k = k
-        if tol <= 0.0:
-            raise ValueError("tol (initial tolerance/bandwidth) must be > 0.")
-        self.tol = tol  # read-only initial tolerance; never mutated
         if min_tol is not None and min_tol < 0:
             raise ValueError("min_tol must be >= 0.")
         self.min_tol = min_tol
@@ -610,6 +614,21 @@ class ABCPMC(Propagator):
         self.kernel_name = kernel
         self._kernel_fn: _Kernel = _make_kernel(kernel)
         self._kernel_aware = kernel != "hard"
+        if tol is None:
+            if not self._kernel_aware:
+                raise ValueError(
+                    "ABCPMC with the hard kernel requires an explicit tol (initial "
+                    "rejection threshold); the data-driven default (tol=None) is "
+                    "available only for smooth kernels."
+                )
+        elif tol <= 0.0:
+            raise ValueError("tol (initial tolerance/bandwidth) must be > 0.")
+        self.tol = tol  # read-only; None = data-driven initial bandwidth (smooth kernels)
+        # Internal fallback where a numeric tolerance is structurally required
+        # (cache construction/rebuild, scheduler initial_tol). +inf encodes
+        # "no bandwidth fixed yet"; the data-driven value replaces it in
+        # __call__ once k finite-loss individuals exist.
+        self._tol_fallback = tol if tol is not None else float("inf")
         if not (0.0 < ess_target <= 1.0):
             raise ValueError("ess_target must be in (0, 1].")
         self.ess_target = float(ess_target)
@@ -620,7 +639,7 @@ class ABCPMC(Propagator):
             raise ValueError("bisect_interval must be >= 1.")
         self.tolerance_scheduler = create_scheduler(
             scheduler_type,
-            tol,
+            self._tol_fallback,
             k,
             self.additional_needed_inds,
             kernel_aware=self._kernel_aware,
@@ -630,6 +649,13 @@ class ABCPMC(Propagator):
             bisect_interval=bisect_interval,
             **kwargs,
         )
+        if self._kernel_aware:
+            logger.info(
+                "ABCPMC: smooth kernel '%s' selects the bandwidth by target-ESS "
+                "search; scheduler_type='%s' applies only under the hard kernel.",
+                kernel,
+                scheduler_type,
+            )
         self.rng_np = np.random.default_rng(
             self.rng.getrandbits(128)
         )  # Derive NumPy seed from Propagator RNG
@@ -647,7 +673,7 @@ class ABCPMC(Propagator):
         # Mean squared box width; sets the absolute floor of the scale-aware
         # covariance jitter in _build_proposal.
         self._mean_box_sq = float(np.mean((self._hi - self._lo) ** 2))
-        self._cache = _IncrementalCache(self.tol)
+        self._cache = _IncrementalCache(self._tol_fallback)
 
         # AMIS snapshot ring buffer (performance state, not algorithmic state).
         if amis_snapshots < 0:
@@ -717,7 +743,7 @@ class ABCPMC(Propagator):
                 self._calls_since_snapshot = 0
             for ind in inds:
                 self._check_loss(ind)
-            self._cache.rebuild(inds, self.tol)
+            self._cache.rebuild(inds, self._tol_fallback)
             self.tolerance_scheduler.reset_cache()
         elif n > cached_len:
             # Pure append — process the new tail incrementally.
@@ -890,6 +916,26 @@ class ABCPMC(Propagator):
         log_box_mass = _log_box_mass(positions, sigma, self._lo, self._hi)
         return positions, weights, L, log_box_mass
 
+    def _initial_bandwidth_from_history(self) -> Optional[float]:
+        """Data-driven initial bandwidth for ``tol=None`` (smooth kernels).
+
+        Median loss of the first ``k`` finite-loss individuals in generation
+        order; ``None`` while fewer than ``k`` exist (still bootstrap). A pure
+        function of the history *set* (generation order is total after the
+        ``(generation, island, rank)`` tie-break), so it is identical after a
+        crash/restart. Only consulted until the first stamped tolerance
+        enters the history, after which the running minimum takes over —
+        so late-arriving stragglers with early generation order can shift it
+        only during the short pre-stamp window.
+        """
+        finite: List[float] = []
+        for ind in self._cache._by_gen:
+            if np.isfinite(ind.loss):
+                finite.append(float(ind.loss))
+                if len(finite) == self.k:
+                    return float(np.median(finite))
+        return None
+
     def __call__(self, inds: List[Individual]) -> Individual:
         """
         Generate a new candidate individual.
@@ -914,7 +960,7 @@ class ABCPMC(Propagator):
         """
         # 1. Reconstruct effective bandwidth from history.
         self._update_cache(inds)
-        tol_from_history = self._cache.tol_from_history
+        tol_from_history = self._cache.tol_from_history  # +inf while unfixed in data-driven mode
         current_tol = tol_from_history
         if self.min_tol is not None:
             current_tol = max(current_tol, self.min_tol)
@@ -922,9 +968,20 @@ class ABCPMC(Propagator):
         # 2. Bootstrap (prior) phase. Hard kernel preserves the classical
         #    rule (need k particles below current threshold); smooth kernels
         #    use the simpler "len(history) >= k" rule since the kernel
-        #    handles acceptance smoothly with no hard discontinuity.
+        #    handles acceptance smoothly with no hard discontinuity. In
+        #    data-driven mode (tol=None) no bandwidth is fixed until a
+        #    stamped tolerance exists; derive it from the bootstrap losses,
+        #    staying in the prior phase until k finite-loss individuals
+        #    exist.
         if self.kernel_name == "hard":
             need_more_particles = self._cache.count_below(current_tol) < self.k
+        elif self.tol is None and not np.isfinite(current_tol):
+            eps0 = self._initial_bandwidth_from_history()
+            if eps0 is None:
+                need_more_particles = True
+            else:
+                current_tol = eps0 if self.min_tol is None else max(eps0, self.min_tol)
+                need_more_particles = False
         else:
             history_len = max(0, self._cache.history_len)
             need_more_particles = history_len < self.k
@@ -1206,10 +1263,6 @@ class ABCPMC(Propagator):
         positions = np.stack([ind.position for ind in inds])  # (n, d)
         losses = np.array([float(ind.loss) for ind in inds])
 
-        tols = [ind.tolerance for ind in inds if ind.tolerance is not None]
-        if eps_final is None:
-            eps_final = min(tols) if tols else self.tol
-
         # Archive-phase calls: those whose proposal stamped a tolerance. Bootstrap
         # (uniform-prior) draws have tolerance is None.
         archive_idx = [i for i, ind in enumerate(inds) if ind.tolerance is not None]
@@ -1217,6 +1270,13 @@ class ABCPMC(Propagator):
             # Never left the bootstrap phase: every draw is a uniform-prior draw,
             # so the posterior is the (flat) prior — equal weights.
             return positions, np.full(n, 1.0 / n)
+
+        if eps_final is None:
+            # Tightest bandwidth reached over the history. archive_idx is
+            # nonempty here, so at least one stamped tolerance exists (this
+            # must not fall back to self.tol, which is None in data-driven
+            # mode).
+            eps_final = min(inds[i].tolerance for i in archive_idx)
 
         if n_proposals is None:
             n_proposals = self._amis_snapshots if self._amis_snapshots > 0 else 1
