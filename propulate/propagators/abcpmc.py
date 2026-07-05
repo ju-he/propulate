@@ -1337,7 +1337,15 @@ class ABCPMC(Propagator):
             snap_taus.append(tau)
 
         if not snapshots:
-            return positions, np.full(n, 1.0 / n)
+            # No past proposal could be reconstructed although archive-phase
+            # calls exist — the retroactive estimator is undefined. Returning
+            # a flat prior here would masquerade as a posterior downstream
+            # (SBC), so crash loudly instead.
+            raise RuntimeError(
+                "extract_posterior: no past proposal could be reconstructed "
+                f"from the history ({len(archive_idx)} archive-phase calls, "
+                f"k={self.k}); the retroactive estimator is undefined."
+            )
 
         # Cumulative proposal mixture q̄, evaluated at EVERY particle (the
         # retroactive step). The deterministic-mixture balance heuristic (Owen
@@ -1382,7 +1390,15 @@ class ABCPMC(Propagator):
             log_w[start:stop] = log_prior + log_kernel[start:stop] - log_qbar
         finite = np.isfinite(log_w)
         if not finite.any():
-            return positions, np.full(n, 1.0 / n)
+            # Every retroactive log-weight is non-finite: the estimator is
+            # degenerate (e.g. all kernel weights underflowed at eps_final).
+            # A flat prior masquerading as a posterior would silently corrupt
+            # downstream calibration — crash loudly instead.
+            raise RuntimeError(
+                "extract_posterior: all retroactive log-weights are "
+                f"non-finite at eps_final={eps_final!r}; the estimator is "
+                "degenerate."
+            )
         log_w = np.where(finite, log_w - np.max(log_w[finite]), -np.inf)
         weights = np.where(finite, np.exp(log_w), 0.0)
         total = weights.sum()
