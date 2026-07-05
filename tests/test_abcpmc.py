@@ -2207,3 +2207,78 @@ try:
 
 except ImportError:
     pass
+
+
+class TestGeometricDecayCachedOutOfOrder:
+    """Cached epoch replay must stay equivalent to the pure replay when a
+    cross-rank individual sorts (by ``_gen_order``) into the already-consumed
+    prefix of ``accepted_by_gen`` — the out-of-order arrival case under MPI.
+
+    The consumed-count watermark alone cannot detect such an insertion: it
+    shifts every epoch boundary while leaving the count of newly appended
+    elements the same. Regression test for the prefix-integrity guard.
+    """
+
+    def _views(self, inds):
+        from sortedcontainers import SortedKeyList
+
+        from propulate.propagators.abcpmc import _gen_order
+
+        by_loss = SortedKeyList(inds, key=lambda i: i.loss)
+        by_gen = SortedKeyList(inds, key=_gen_order)
+        return by_loss, by_gen
+
+    def test_out_of_order_arrival_matches_pure_replay(self):
+        cached = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+        pure = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+
+        # Six local individuals (rank -1), generations 0..5: two epochs, both
+        # fully surviving the tightened threshold -> tol 1.0 * 0.9^2 = 0.81.
+        inds = [make_ind(0.1, generation=g) for g in range(6)]
+        by_loss, by_gen = self._views(inds)
+        tol_first = cached.compute_cached(list(by_gen), 1.0, by_loss, by_gen, by_gen)
+        assert tol_first == pytest.approx(pure.compute(list(by_gen), 1.0))
+        assert tol_first == pytest.approx(0.81)
+
+        # Cross-rank straggler: generation 1, rank 1 sorts between the local
+        # generation-1 and generation-2 individuals, i.e. INTO the consumed
+        # prefix. Its loss (0.95) is accepted at the initial tolerance but
+        # dies at the tightened 0.9, so the re-partitioned first epoch no
+        # longer decays: the pure replay now yields 0.9, not 0.81.
+        late = make_ind(0.95, generation=1)
+        late.rank = 1
+        by_gen.add(late)
+        by_loss.add(late)
+        inds_now = list(by_gen)
+        expected = pure.compute(inds_now, 1.0)
+        assert expected == pytest.approx(0.9)
+        got = cached.compute_cached(inds_now, 1.0, by_loss, by_gen, by_gen)
+        assert got == pytest.approx(expected)
+
+    def test_append_only_path_still_incremental(self):
+        from propulate.propagators.abcpmc import _gen_order
+
+        cached = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+        pure = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+        inds = [make_ind(0.1, generation=g) for g in range(3)]
+        by_loss, by_gen = self._views(inds)
+        cached.compute_cached(list(by_gen), 1.0, by_loss, by_gen, by_gen)
+        assert cached._cached_consumed == 3
+        for g in (6, 7, 8):  # in-order appends: prefix stays intact
+            nxt = make_ind(0.1, generation=g)
+            by_gen.add(nxt)
+            by_loss.add(nxt)
+        got = cached.compute_cached(list(by_gen), 1.0, by_loss, by_gen, by_gen)
+        assert got == pytest.approx(pure.compute(list(by_gen), 1.0))
+        assert cached._cached_consumed == 6
+        assert cached._cached_last_key == _gen_order(by_gen[5])
+
+    def test_reset_cache_clears_prefix_key(self):
+        sched = GeometricDecayScheduler(1.0, 3, 0, decay_factor=0.9)
+        inds = [make_ind(0.1, generation=g) for g in range(3)]
+        by_loss, by_gen = self._views(inds)
+        sched.compute_cached(list(by_gen), 1.0, by_loss, by_gen, by_gen)
+        assert sched._cached_last_key is not None
+        sched.reset_cache()
+        assert sched._cached_last_key is None
+        assert sched._cached_consumed == 0

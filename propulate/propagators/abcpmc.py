@@ -1815,6 +1815,9 @@ class GeometricDecayScheduler(EpsilonScheduler):
         self.decay_factor = decay_factor
         self._cached_consumed = 0
         self._cached_tol = initial_tol
+        # Sort key (_gen_order) of the last consumed element — guards the
+        # incremental path against out-of-order arrivals; see compute_cached.
+        self._cached_last_key: Optional[tuple] = None
 
     def compute(self, inds: List[Individual], current_tol: float) -> float:
         """
@@ -1867,6 +1870,19 @@ class GeometricDecayScheduler(EpsilonScheduler):
         batch_size = self.population_size + self.additional_needed_inds
         tol = self._cached_tol
         consumed = self._cached_consumed
+        # Prefix-integrity guard: under MPI a cross-rank individual can sort
+        # (by _gen_order) INTO the already-consumed prefix of accepted_by_gen,
+        # shifting every epoch boundary; the consumed-count watermark alone
+        # cannot see this. Remember the sort key of the last consumed element:
+        # if the element now sitting at the watermark differs, the prefix
+        # changed — replay from scratch over the same sorted view, preserving
+        # the equivalence contract with compute() (class docstring).
+        if consumed > 0 and (
+            len(accepted_by_gen) < consumed
+            or _gen_order(accepted_by_gen[consumed - 1]) != self._cached_last_key
+        ):
+            tol = self.initial_tol
+            consumed = 0
         while consumed + batch_size <= len(accepted_by_gen):
             batch = accepted_by_gen[consumed : consumed + batch_size]
             next_tol = self.decay_factor * tol
@@ -1876,12 +1892,16 @@ class GeometricDecayScheduler(EpsilonScheduler):
             consumed += batch_size
         self._cached_consumed = consumed
         self._cached_tol = tol
+        self._cached_last_key = (
+            _gen_order(accepted_by_gen[consumed - 1]) if consumed > 0 else None
+        )
         return tol
 
     def reset_cache(self) -> None:
         super().reset_cache()
         self._cached_consumed = 0
         self._cached_tol = self.initial_tol
+        self._cached_last_key = None
 
 
 class AcceptanceRateScheduler(EpsilonScheduler):
