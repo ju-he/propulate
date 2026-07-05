@@ -1390,6 +1390,132 @@ class ABCPMC(Propagator):
         return positions, weights
 
 
+def _relative_kernel_ess(
+    weights: np.ndarray, losses: np.ndarray, kfn: "_Kernel", eps: float
+) -> float:
+    """Relative kernel-weighted ESS in [0, 1] at bandwidth *eps*.
+
+    Computed in log-space via logsumexp to remain stable for Gaussian
+    kernels in regimes where K_eps(ρ) spans many decades. Returns 0.0
+    when the effective weight vector is all zero.
+    """
+    if weights.size == 0:
+        return 0.0
+    log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
+    log_k = kfn.log_weight(losses, eps)
+    log_eff = log_w + log_k
+    if not np.isfinite(log_eff).any():
+        return 0.0
+    log_sum = float(logsumexp(log_eff))
+    log_sum_sq = float(logsumexp(2.0 * log_eff))
+    # ESS = exp(2 log_sum - log_sum_sq); divide by N for the relative form.
+    return float(np.exp(2.0 * log_sum - log_sum_sq) / weights.size)
+
+
+def select_eps_by_ess_retention(
+    weights: np.ndarray,
+    losses: np.ndarray,
+    current_tol: float,
+    kernel_fn: "_Kernel",
+    *,
+    ess_target: float = 0.95,
+    max_tighten_factor: float = 0.5,
+    grid_points: int = 32,
+    bisect_iterations: int = 32,
+    bisect_tol: float = 1e-4,
+) -> float:
+    """Return the largest ε ≤ current_tol retaining a fixed fraction of the ESS.
+
+    This is the Del Moral, Doucet & Jasra 2012 *successive-population* rule:
+    pick ε_new so that ``ESS(w·K_{ε_new}) = α · ESS(w·K_{ε_current})`` with
+    ``α = ess_target`` (default 0.95), i.e. each step retains a fixed
+    fraction of the current effective sample size. Targeting a *ratio* of
+    the current ESS — rather than an absolute ``ESS/N`` floor — means a
+    tightening direction always exists, so the bandwidth keeps sharpening
+    instead of stalling once the absolute ESS drops below the floor.
+
+    ESS(ε) is **not monotone in ε** in general. With skewed core weights —
+    a heavy importance weight sitting on a high-loss particle, which is the
+    *generic* case for heavy-tailed IS weights, not a corner — tightening ε
+    first kills the heavy component and *raises* the ESS before the usual
+    concentration on the lowest-loss particles brings it down again. A
+    plain bisection on ``[~0, current_tol]`` brackets across that bump and
+    can land orders of magnitude too tight. The search here instead scans a
+    geometric grid downward from ``current_tol`` and takes the **first
+    (largest) ε whose ESS meets the goal**, then refines by bisection
+    inside that single grid interval, where the crossing is bracketed.
+
+    Every proposal is floored at ``max_tighten_factor · current_tol``. If
+    no grid point above the floor meets the goal — a flat ESS curve, e.g.
+    losses tied at identical values as produced by discrete summary
+    statistics — the floor itself is returned: bounded per-call tightening
+    instead of the unbounded collapse a "maximal tightening" clip would
+    produce.
+
+    This module-level pure function is the single implementation of the
+    rule: :meth:`EpsilonScheduler._bisect_target_ess` delegates here for the
+    asynchronous per-arrival schedule, and the matched-kernel synchronous
+    pyABC baseline (async-abc-paper experiments) applies the same rule once
+    per generation — both arms of the paper's comparison therefore share one
+    bandwidth-selection implementation.
+    """
+    if kernel_fn is None:
+        raise ValueError("select_eps_by_ess_retention requires a kernel_fn.")
+    if not (0.0 < ess_target <= 1.0):
+        raise ValueError("ess_target must be in (0, 1].")
+    if not (0.0 < max_tighten_factor < 1.0):
+        raise ValueError("max_tighten_factor must be in (0, 1).")
+    if grid_points < 2:
+        raise ValueError("grid_points must be >= 2.")
+    weights = np.asarray(weights, dtype=float)
+    losses = np.asarray(losses, dtype=float)
+    if current_tol <= 0.0 or weights.size == 0:
+        return current_tol
+
+    ess_current = _relative_kernel_ess(weights, losses, kernel_fn, current_tol)
+    if ess_current <= 0.0:
+        # Degenerate: no effective weight at current_tol (e.g. all archive
+        # members already outside a compact kernel's support). Nothing to do.
+        return current_tol
+    ess_goal = ess_target * ess_current
+
+    # Per-call tightening cap: never propose below this floor.
+    floor = max_tighten_factor * current_tol
+
+    # Downward scan: find the first (largest) grid point meeting the goal.
+    # Invariant: ESS(high) > ess_goal (holds at ε = current_tol since
+    # ess_goal < ess_current).
+    ratio = max_tighten_factor ** (1.0 / (grid_points - 1))
+    high = current_tol
+    bracket_low = None
+    for i in range(1, grid_points):
+        eps = current_tol * ratio**i
+        if _relative_kernel_ess(weights, losses, kernel_fn, eps) <= ess_goal:
+            bracket_low = eps
+            break
+        high = eps
+    if bracket_low is None:
+        # Even the maximal allowed tightening retains more ESS than the
+        # goal. Tighten at the bounded rate.
+        return floor
+
+    # Refine within the single grid interval [bracket_low, high] where the
+    # crossing is bracketed: ESS(high) > ess_goal >= ESS(bracket_low).
+    low = bracket_low
+    for _ in range(bisect_iterations):
+        mid = 0.5 * (low + high)
+        ess_mid = _relative_kernel_ess(weights, losses, kernel_fn, mid)
+        if abs(ess_mid - ess_goal) <= bisect_tol:
+            return mid
+        if ess_mid > ess_goal:
+            # ε too loose — too much ESS retained; tighten.
+            high = mid
+        else:
+            # ε too tight — too little ESS retained; relax.
+            low = mid
+    return 0.5 * (low + high)
+
+
 class EpsilonScheduler(ABC):
     """
     Base class for bandwidth scheduling in ABC-PMC.
@@ -1503,105 +1629,32 @@ class EpsilonScheduler(ABC):
 
     @staticmethod
     def _relative_ess(weights: np.ndarray, losses: np.ndarray, kfn: "_Kernel", eps: float) -> float:
-        """Relative kernel-weighted ESS in [0, 1] at bandwidth *eps*.
-
-        Computed in log-space via logsumexp to remain stable for Gaussian
-        kernels in regimes where K_eps(ρ) spans many decades. Returns 0.0
-        when the effective weight vector is all zero.
-        """
-        if weights.size == 0:
-            return 0.0
-        log_w = np.where(weights > 0.0, np.log(np.where(weights > 0.0, weights, 1.0)), -np.inf)
-        log_k = kfn.log_weight(losses, eps)
-        log_eff = log_w + log_k
-        if not np.isfinite(log_eff).any():
-            return 0.0
-        log_sum = float(logsumexp(log_eff))
-        log_sum_sq = float(logsumexp(2.0 * log_eff))
-        # ESS = exp(2 log_sum - log_sum_sq); divide by N for the relative form.
-        return float(np.exp(2.0 * log_sum - log_sum_sq) / weights.size)
+        """Delegate to :func:`_relative_kernel_ess` (kept for existing callers)."""
+        return _relative_kernel_ess(weights, losses, kfn, eps)
 
     def _bisect_target_ess(
         self, weights: np.ndarray, losses: np.ndarray, current_tol: float
     ) -> float:
-        """Return the largest ε ≤ current_tol retaining a fixed fraction of the ESS.
+        """Delegate to :func:`select_eps_by_ess_retention` with this scheduler's knobs.
 
-        This is the Del Moral, Doucet & Jasra 2012 *successive-population* rule:
-        pick ε_new so that ``ESS(w·K_{ε_new}) = α · ESS(w·K_{ε_current})`` with
-        ``α = ess_target`` (default 0.95), i.e. each step retains a fixed
-        fraction of the current effective sample size. Targeting a *ratio* of
-        the current ESS — rather than an absolute ``ESS/N`` floor — means a
-        tightening direction always exists, so the bandwidth keeps sharpening
-        instead of stalling once the absolute ESS drops below the floor.
-
-        ESS(ε) is **not monotone in ε** in general. With skewed core weights —
-        a heavy importance weight sitting on a high-loss particle, which is the
-        *generic* case for heavy-tailed IS weights, not a corner — tightening ε
-        first kills the heavy component and *raises* the ESS before the usual
-        concentration on the lowest-loss particles brings it down again. A
-        plain bisection on ``[~0, current_tol]`` brackets across that bump and
-        can land orders of magnitude too tight. The search here instead scans a
-        geometric grid downward from ``current_tol`` and takes the **first
-        (largest) ε whose ESS meets the goal**, then refines by bisection
-        inside that single grid interval, where the crossing is bracketed.
-
-        Every proposal is floored at ``max_tighten_factor · current_tol``. If
-        no grid point above the floor meets the goal — a flat ESS curve, e.g.
-        losses tied at identical values as produced by discrete summary
-        statistics — the floor itself is returned: bounded per-call tightening
-        instead of the unbounded collapse a "maximal tightening" clip would
-        produce.
-
-        The ``/N`` in :meth:`_relative_ess` cancels in the ratio, so the relative
-        form is used throughout.
+        The rule itself lives at module level so that the matched-kernel
+        synchronous pyABC baseline can apply the identical bandwidth-selection
+        implementation once per generation; see the module function's
+        docstring for the full rationale.
         """
         kfn = self.kernel_fn
         assert kfn is not None  # guarded by _use_kernel_aware
-        if current_tol <= 0.0 or weights.size == 0:
-            return current_tol
-
-        ess_current = self._relative_ess(weights, losses, kfn, current_tol)
-        if ess_current <= 0.0:
-            # Degenerate: no effective weight at current_tol (e.g. all archive
-            # members already outside a compact kernel's support). Nothing to do.
-            return current_tol
-        ess_goal = self.ess_target * ess_current
-
-        # Per-call tightening cap: never propose below this floor.
-        floor = self.max_tighten_factor * current_tol
-
-        # Downward scan: find the first (largest) grid point meeting the goal.
-        # Invariant: ESS(high) > ess_goal (holds at ε = current_tol since
-        # ess_goal < ess_current).
-        ratio = self.max_tighten_factor ** (1.0 / (self._ESS_GRID_POINTS - 1))
-        high = current_tol
-        bracket_low = None
-        for i in range(1, self._ESS_GRID_POINTS):
-            eps = current_tol * ratio**i
-            if self._relative_ess(weights, losses, kfn, eps) <= ess_goal:
-                bracket_low = eps
-                break
-            high = eps
-        if bracket_low is None:
-            # Even the maximal allowed tightening retains more ESS than the
-            # goal. Tighten at the bounded rate.
-            return floor
-
-        # Refine within the single grid interval [bracket_low, high] where the
-        # crossing is bracketed: ESS(high) > ess_goal >= ESS(bracket_low).
-        low = bracket_low
-        for _ in range(self._BISECT_ITERATIONS):
-            mid = 0.5 * (low + high)
-            ess_mid = self._relative_ess(weights, losses, kfn, mid)
-            if abs(ess_mid - ess_goal) <= self._BISECT_TOL:
-                return mid
-            if ess_mid > ess_goal:
-                # ε too loose — too much ESS retained; tighten.
-                high = mid
-            else:
-                # ε too tight — too little ESS retained; relax.
-                low = mid
-        return 0.5 * (low + high)
+        return select_eps_by_ess_retention(
+            weights,
+            losses,
+            current_tol,
+            kfn,
+            ess_target=self.ess_target,
+            max_tighten_factor=self.max_tighten_factor,
+            grid_points=self._ESS_GRID_POINTS,
+            bisect_iterations=self._BISECT_ITERATIONS,
+            bisect_tol=self._BISECT_TOL,
+        )
 
     def _kernel_aware_from_accepted(
         self,
