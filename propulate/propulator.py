@@ -170,28 +170,45 @@ class Propulator:
         self.intra_requests: list[MPI.Request] = []  # Keep track of intra-island send requests.
         self.intra_buffers: list[Individual] = []  # Send buffers for intra-island communication
 
-        # Load initial population of evaluated individuals from checkpoint if exists.
-        load_ckpt_file = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
-        if not os.path.isfile(load_ckpt_file):  # If not exists, check for backup file.
-            load_ckpt_file = load_ckpt_file.with_suffix(".bkp")
-
-        if os.path.isfile(load_ckpt_file):
-            with open(load_ckpt_file, "rb") as f:
-                try:
-                    self.population = pickle.load(f)
-                    self.generation = (
-                        max([x.generation for x in self.population if x.rank == self.island_comm.rank]) + 1
-                    )  # Determine generation to be evaluated next from population checkpoint.
-                    if self.island_comm.rank == 0:
-                        log.info(f"Valid checkpoint file found. Resuming from generation {self.generation} of loaded population...")
-                except OSError:
-                    self.population = []
-                    if self.island_comm.rank == 0:
-                        log.info("No valid checkpoint file. Initializing population randomly...")
-        else:
-            self.population = []
+        # Load initial population of evaluated individuals from checkpoint if it
+        # exists. A crash *during* a checkpoint dump truncates the primary
+        # ``.pickle`` (``_dump_checkpoint`` renames the last-good file to ``.bkp``
+        # BEFORE writing the new one, so ``.bkp`` is the intact previous state).
+        # Recovery must therefore fall back to ``.bkp`` when the primary is
+        # *corrupt*, not only when it is *missing* — and unpickling a truncated
+        # file raises ``EOFError``/``UnpicklingError``, neither of which is an
+        # ``OSError``. Try each candidate in order and accept the first that loads.
+        primary_ckpt = self.checkpoint_path / f"island_{self.island_idx}_ckpt.pickle"
+        backup_ckpt = primary_ckpt.with_suffix(".bkp")
+        self.population = []
+        loaded_from = None
+        for candidate in (primary_ckpt, backup_ckpt):
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "rb") as f:
+                    population = pickle.load(f)
+                generation = (
+                    max([x.generation for x in population if x.rank == self.island_comm.rank]) + 1
+                )  # Determine generation to be evaluated next from population checkpoint.
+            except (EOFError, pickle.UnpicklingError, OSError, ValueError, IndexError) as exc:
+                if self.island_comm.rank == 0:
+                    log.warning(f"Checkpoint '{candidate.name}' is unreadable ({exc!r}); trying next candidate.")
+                continue
+            self.population = population
+            self.generation = generation
+            loaded_from = candidate
+            break
+        if loaded_from is not None:
             if self.island_comm.rank == 0:
-                log.info("No valid checkpoint file given. Initializing population randomly...")
+                note = "" if loaded_from == primary_ckpt else f" (recovered from backup '{loaded_from.name}')"
+                log.info(
+                    f"Valid checkpoint file found. Resuming from generation {self.generation} "
+                    f"of loaded population{note}..."
+                )
+        else:
+            if self.island_comm.rank == 0:
+                log.info("No valid checkpoint file. Initializing population randomly...")
 
         # Incrementally maintained view of the active population. Rebuilding
         # it with an O(N) scan on every breed dominates the steady-state cost
